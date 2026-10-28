@@ -67,3 +67,8 @@ Files ending in `_presentation.png` are larger-font versions for slides.
 - Random draws use fixed seeds, so re-running step 3 reproduces the included outputs exactly.
 - Weather each year is drawn independently, with equal probability, from the 35 historical weather years.
 - Dollar totals over a horizon are undiscounted sums of mean annual profit.
+
+## License
+
+- Code (everything in `code/`, plus `run_all.R` and `.Rprofile`): MIT License; see `LICENSE`.
+- Data (`data/`) and the included outputs (`results/`): Creative Commons Attribution 4.0 International (CC BY 4.0), <https://creativecommons.org/licenses/by/4.0/>. Please cite the paper when you use them.
