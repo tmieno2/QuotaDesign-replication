@@ -1,0 +1,504 @@
+---
+title: "Simulation overview: how the DP is built and run"
+format:
+  html:
+    toc: true
+    number-sections: true
+---
+
+```{r setup}
+#| include: false
+library(data.table)
+library(ggplot2)
+library(here)
+```
+
+# Purpose
+
+This document explains what the three pipeline scripts in this folder
+actually compute, the mathematical objects they manipulate, and how
+they are wired together.
+
+| Stage | Script | Role |
+|-------|--------|----------------------------------------------------|
+| 1 | `01-data-prep.qmd` | Build the per-period payoff primitives: yield, irrigation, profit per (SMT, weather year) cell, and reduce the SMT action space to a yield-irrigation frontier. |
+| 2 | `02-1-solve-DP.qmd` (+ `R/backward_induction.R`) | For each quota-design parameter combination, solve the farmer's stochastic dynamic program by backward induction and store, for every (period within the allocation cycle, beginning quota), the optimal SMT and the expected continuation profit. |
+| 3 | `03-1-simulate.qmd` (+ `R/simulate.R`) | Forward simulate many sample paths of a farmer following the optimal policy from Stage 2 under random weather draws, and summarize the resulting yield, irrigation, and profit distributions across paths and periods. |
+
+The diagram is
+
+```
+AquaCrop output --> Stage 1 (frontier SMTs, profit table)
+                         |
+                         v
+                   Stage 2 (backward induction)
+                   policy V_t(.), s*_t(.)
+                         |
+                         v
+                   Stage 3 (forward simulation under random weather)
+                   distributions of yield, irrigation, profit
+```
+
+# Notation
+
+| Symbol | Code object | Meaning |
+|---|---|---|
+| $s$ | `smt` | Soil moisture target (the farmer's discrete action). |
+| $\phi$ | `year` | Weather year drawn from the AquaCrop panel ($|\Phi| = 35$). |
+| $f(s,\phi)$ | `yield` | Corn yield (bu/acre) from AquaCrop for action $s$ in weather $\phi$. |
+| $g(s,\phi)$ | `ir` | Irrigation water applied (inches) for action $s$ in weather $\phi$. |
+| $p$ | `corn_P = 4` | Corn price ($/bu). |
+| $c$ | `ir_P = 6` | Irrigation cost ($/inch). |
+| $\lambda$ | constant 600 (added in simulation) | All other production costs ($/acre); enters only as a level shift. |
+| $\delta$ | `sigma = 1/1.05` | Per-period discount factor. |
+| $AQ$ | `annual_quota` | Annual quota allocation (inches). |
+| $AL$ | `alloc_year` | Number of years in one allocation period. |
+| $W_{total}$ | `W_total = AL * AQ` | Total quota refreshed at the start of each allocation period. |
+| $\eta$ | `co_ratio`, $\in [0,1]$ | Carry-over ratio applied to unused quota at the end of an allocation period. |
+| $\tau$ | `max_co_ratio` | Cap on carry-over expressed as a multiple of $W_{total}$. |
+| $\gamma$ | `pen_ratio`, $\ge 1$ | Penalty multiplier applied to overdraft at the end of an allocation period. |
+| $W_t$ | `W` / `W_it` | Quota balance at the beginning of period $t$. |
+| $y_t$ | `year_in_alloc` | Year position within the current allocation period, $y_t \in \{1,\dots,AL\}$. |
+| $w_t$ | `ir` realized | Water actually used in period $t$, $w_t = g(s_t,\phi_t)$. |
+| $V_t(W)$ | `e_pi` in `opt_choice_ls[[t]]` | Value function: expected NPV of profit from $t$ onward at quota $W$, evaluated at $y_t$ implied by $t$. |
+| $s_t^\star(W)$ | `smt` in `opt_choice_ls[[t]]` | Optimal SMT at $(t,W)$. |
+
+# Stage 1: From AquaCrop output to the per-period profit table
+
+## 1.1 Raw water-yield data
+
+The AquaCrop output is a $|\mathcal S| \times |\Phi|$ matrix of yields and a parallel matrix of irrigation amounts. Stage 1 reshapes them into long form (`yield_data`, `irr_data`) so each row is one $(s,\phi)$ cell. Units are converted to bu/acre and inches:
+
+$$
+f_{s,\phi} \;=\; \text{(AquaCrop yield)}_{s,\phi} \,/\, 0.06,
+\qquad
+g_{s,\phi} \;=\; \text{(AquaCrop irrigation in mm)}_{s,\phi} \times 0.0393701.
+$$
+
+## 1.2 Expected yield and irrigation by SMT
+
+Taking the empirical expectation over the $|\Phi|=35$ weather years gives the SMT-level expectations:
+
+$$
+\bar f(s) \;=\; \frac{1}{|\Phi|} \sum_{\phi \in \Phi} f_{s,\phi},
+\qquad
+\bar g(s) \;=\; \frac{1}{|\Phi|} \sum_{\phi \in \Phi} g_{s,\phi}.
+$$
+
+These live in `e_yield` and `e_ir`, combined into `e_data`.
+
+## 1.3 Frontier reduction of the action space
+
+Many SMTs are dominated in expectation. To shrink the state-action problem in Stage 2, the script bins SMTs by expected irrigation in 0.05-inch bins,
+
+$$
+B_k \;=\; \big\{ s : \bar g(s) \in [\underline g + 0.05(k-1),\, \underline g + 0.05 k) \big\},
+$$
+
+and keeps, from each non-empty bin, the SMT with the largest expected yield:
+
+$$
+\mathcal S^\star \;=\; \{1\} \;\cup\; \bigcup_{k} \arg\max_{s \in B_k} \bar f(s).
+$$
+
+SMT $s=1$ (rainfed) is always included because it is the only feasible action when the quota is exhausted. The result is saved as `data_for_sim` and used everywhere downstream as the decision space. Per-period profit is then defined cell-by-cell at the start of Stage 2:
+
+$$
+\pi(s,\phi) \;=\; p\, f_{s,\phi} \,-\, c\, g_{s,\phi}.
+$$
+
+### Worked example {#sec-frontier-example .unnumbered}
+
+The chunk below reproduces the binning and filtering rule directly from the saved raw AquaCrop output. The AquaCrop panel has $|\mathcal S|$ candidate SMTs in total, and the frontier subset $\mathcal S^\star$ is much smaller.
+
+```{r frontier-example}
+#| message: false
+#| warning: false
+
+raw <- readRDS(here::here("data/processed/aq_raw_data.rds"))
+e_data <- raw[, .(e_yield = mean(yield), e_ir = mean(ir)), by = smt]
+
+seq_bin <- seq(min(e_data$e_ir), max(e_data$e_ir) + 0.1, by = 0.05)
+e_data[, bin := findInterval(e_ir, seq_bin)]
+
+frontier_smts <- e_data[, .SD[which.max(e_yield)], by = bin]$smt
+frontier_smts <- union(1L, frontier_smts)
+
+c(total_smts = uniqueN(e_data$smt),
+  frontier_smts = length(frontier_smts))
+```
+
+A snapshot of one bin makes the "keep the argmax-$\bar f$ row" rule concrete. Bin 60 contains 12 SMTs whose expected irrigation is within a 0.05-inch window; only the one with the highest expected yield survives.
+
+```{r frontier-example-table}
+e_data[bin == 60][order(-e_yield)][,
+  .(smt, e_ir = round(e_ir, 3), e_yield = round(e_yield, 2),
+    on_frontier = smt %in% frontier_smts)
+]
+```
+
+The plot overlays the frontier (red) on all SMT means (grey). The frontier traces the upper envelope of the yield-irrigation cloud, which is what Stage 2 actually sees.
+
+```{r}
+#| label: fig-frontier
+#| fig-cap: "All SMT means (grey) and the frontier $\\mathcal{S}^\\star$ (red)."
+#| fig-width: 6
+#| fig-height: 3.5
+
+ggplot(e_data, aes(e_ir, e_yield)) +
+  geom_point(color = "grey75", size = 0.4) +
+  geom_point(data = e_data[smt %in% frontier_smts],
+             color = "firebrick", size = 0.6) +
+  labs(x = "Expected irrigation (inches)",
+       y = "Expected yield (bu/acre)") +
+  theme_bw()
+```
+
+Reference: `01-data-prep.qmd` lines 16-176; `base_data` construction at `02-1-solve-DP.qmd:34-46`.
+
+# Stage 2: Backward induction
+
+## 2.1 The farmer's problem
+
+The farmer chooses an SMT each year to maximize the expected discounted sum of annual profits, subject to the quota dynamics of the design $(AQ, AL, \eta, \tau, \gamma)$:
+
+$$
+\max_{\{s_t\}_{t\ge 1}} \;\; \mathbb E_\phi \!\left[\, \sum_{t=1}^{\infty} \delta^{t-1} \big( p\, f(s_t,\phi_t) \,-\, c\, g(s_t,\phi_t) \,-\, \lambda \big) \,\right]
+$$
+
+subject to the year-in-allocation transition
+
+$$
+y_{t+1} \;=\;
+\begin{cases}
+y_t + 1, & y_t < AL,\\[2pt]
+1, & y_t = AL,
+\end{cases}
+$$
+
+and the quota transition
+
+$$
+W_{t+1} \;=\;
+\begin{cases}
+W_t - w_t, & y_t < AL,\\[6pt]
+W_{total} \;+\; \mathbb{1}\{w_t \le W_t\}\cdot \min\!\big(\tau\, W_{total},\, \eta\, (W_t - w_t)\big)
+\\\qquad\quad +\; \mathbb{1}\{w_t > W_t\}\cdot \gamma\, (W_t - w_t),
+& y_t = AL,
+\end{cases}
+$$
+
+with the no-irrigation constraint
+
+$$
+W_t < 0 \;\Longrightarrow\; s_t = 1 \;\;\;(\text{rainfed only}).
+$$
+
+### Worked quota path {#sec-quota-example .unnumbered}
+
+To make the piecewise transition concrete, the chunk below traces $(y_t, W_t, w_t, W_{t+1})$ over two allocation cycles of $AL = 3$ years, with $AQ = 10$, $\eta = 0.5$, $\tau = 0.5$, $\gamma = 1.5$. Water use is set by hand so the path hits each branch of the transition at least once.
+
+```{r quota-path-example}
+AQ    <- 10
+AL    <- 3
+eta   <- 0.5
+tau   <- 0.5
+gamma <- 1.5
+W_total <- AQ * AL   # = 30
+
+path <- data.table(
+  t = 1:6,
+  y = c(1, 2, 3, 1, 2, 3),
+  w = c(5, 5, 5, 10, 10, 20)
+)
+
+W <- numeric(7); W[1] <- W_total
+branch <- character(6)
+for (i in 1:6) {
+  Wi <- W[i]; wi <- path$w[i]
+  if (path$y[i] < AL) {
+    W[i + 1] <- Wi - wi
+    branch[i] <- "mid-cycle"
+  } else if (wi <= Wi) {
+    W[i + 1] <- W_total + pmin(tau * W_total, eta * (Wi - wi))
+    branch[i] <- "cycle end, leftover"
+  } else {
+    W[i + 1] <- W_total + gamma * (Wi - wi)
+    branch[i] <- "cycle end, overdraft"
+  }
+}
+path[, `:=`(
+  W_t    = round(W[1:6], 2),
+  branch = branch,
+  W_next = round(W[2:7], 2)
+)][]
+```
+
+Reading the rows:
+
++ $t = 1, 2$ and $t = 4, 5$ apply the mid-cycle rule $W_{t+1} = W_t - w_t$.
++ $t = 3$ ends cycle 1 with $W_t - w_t = 15 > 0$, so the leftover branch fires. The carry-over component is $\min(\tau W_{total},\, \eta (W_t - w_t)) = \min(15,\, 7.5) = 7.5$ (so $\eta$ binds, not $\tau$).
++ $t = 6$ ends cycle 2 with $W_t - w_t = -2.5 < 0$, so the penalty branch fires and the next-cycle balance is $W_{total} + \gamma (W_t - w_t) = 30 - 3.75 = 26.25$.
+
+The cap $\tau W_{total}$ would bind instead if $\eta (W_t - w_t)$ ever exceeded it, for instance if $\eta = 1$ and the leftover at cycle end were 20 inches.
+
+The constant $\lambda$ does not affect optimal $s_t$ and is absorbed into the simulation-stage profit (`profit := corn_P * yield - ir_P * ir - 600` at `simulate.R:277`).
+
+## 2.2 Bellman equation
+
+Because weather is i.i.d. across years and the only intertemporal coupling runs through $(W_t, y_t)$, the value function is
+
+$$
+V_t(W) \;=\; \max_{s \,\in\, \mathcal S(W)} \; \mathbb E_{\phi}\!\left[\, p\, f(s,\phi) - c\, g(s,\phi) \,+\, \delta\, V_{t+1}\!\big(W'(W,s,\phi;\,y_t)\big) \,\right],
+$$
+
+where the feasible action set is
+
+$$
+\mathcal S(W) \;=\; \begin{cases}\{1\},& W < 0,\\[2pt]\mathcal S^\star,& W \ge 0,\end{cases}
+$$
+
+and $W'(W,s,\phi;y_t)$ is the quota transition above evaluated at $w = g(s,\phi)$. The dependence of $V_t$ on $y_t$ is folded into the period index because $y_t \equiv ((t-1) \bmod AL) + 1$ is deterministic.
+
+The expectation is computed empirically by averaging over the 35 weather draws in `base_data`.
+
+## 2.3 Terminal value $V_T$
+
+The horizon `prod_T` is set to the smallest multiple of $AL$ that is at least 50 (`backward_induction.R:48`), so the BI loop spans a few decades. At $t=T$ the script first builds the static one-shot maximum payoff at each quota level with a soft over-cap penalty,
+
+$$
+\Pi(W) \;=\; \max_{s \in \mathcal S(W)} \; \frac{1}{|\Phi|} \sum_{\phi} \Big[ p\, f(s,\phi) - c\, g(s,\phi) \;+\; 100 \cdot \min(0,\, W - g(s,\phi)) \Big],
+$$
+
+computed by `find_max_e_pi` (`backward_induction.R:285-309`) over a fine grid $W \in$ `W_ls` (`02-1-solve-DP.qmd:145-167`). The $100 \cdot \min(0, W-g)$ term is a within-period penalty for using more water than the remaining quota; it is only active at the terminal period and damps out quickly as BI proceeds backward.
+
+$V_T$ is then a smooth monotone-increasing spline through $\Pi(W)$:
+
+$$
+V_T \;\approx\; \text{scam}(\Pi(W) \sim s(W,\, \text{bs} = \text{"mpi"})), \qquad \text{(backward\_induction.R:82)}.
+$$
+
+Using a shape-constrained monotone spline is important: $V_T$ must be non-decreasing in $W$ for the BI fixed point to be well behaved.
+
+## 2.4 Quota grid and break points
+
+The BI is solved on a finite grid `W_ls`. Its extremes are
+
+$$
+W_{\min} \;=\; \lfloor \min(\,-\text{max\_ir},\; -\text{max\_ir}\cdot\gamma + W_{total}\,)\rfloor,
+\qquad
+W_{\max} \;=\; W_{total}\,(1 + \tau).
+$$
+
+Because the penalty branch $\gamma(W_t - w_t)$ has slope $\gamma > 1$, $V_t$ has kinks where the policy starts being able to "afford" irrigation in subsequent periods. `get_break_poitns` (`backward_induction.R:262-279`) computes the recursive break locations
+
+$$
+b_i \;=\; \frac{-W_{total} \sum_{j=1}^{i} \gamma^{\,j-1}}{\gamma^{\,i}}, \qquad i = 1,2,\dots,
+$$
+
+and injects $b_i \pm 10^{-4}(i+1)$ into `W_ls` so the value-function spline is sampled densely enough on either side of each kink to resolve it.
+
+### Worked break-point example {#sec-breaks-example .unnumbered}
+
+For $\gamma = 1.5$, $W_{total} = 30$, the first few break points (in inches of $W$) are computed by the same recursion as `get_break_poitns`:
+
+```{r breakpoints-example}
+gamma   <- 1.5
+W_total <- 30
+W_min   <- -50
+
+b <- data.table(i = 1:8)
+b[, part  := -W_total * gamma^(i - 1)]
+b[, denom := gamma^i]
+b[, b_i   := round(cumsum(part) / denom, 3)]
+b <- b[b_i >= W_min, .(i, b_i)]
+b
+```
+
+The locations get closer together as $i$ grows (each is a fixed point of one more application of the penalty branch). The plot below marks them on the $W$ axis so the kink structure of $V_t(W)$ is visible at a glance.
+
+```{r}
+#| label: fig-breakpoints
+#| fig-cap: "Break points $b_i$ on the $W$ axis for $\\gamma = 1.5$, $W_{total} = 30$. The value function $V_t(W)$ has a slope change at each marker, and `W_ls` is densified on both sides of each one."
+#| fig-width: 6
+#| fig-height: 1.8
+
+ggplot(b, aes(x = b_i, y = 0)) +
+  geom_segment(aes(xend = b_i, yend = 1), color = "firebrick") +
+  geom_text(aes(label = paste0("b[", i, "]")),
+            y = 1.15, parse = TRUE, size = 3) +
+  scale_x_continuous(limits = c(W_min, 2), breaks = seq(-50, 0, by = 10)) +
+  scale_y_continuous(limits = c(-0.05, 1.3), expand = c(0, 0)) +
+  labs(x = "W (inches)", y = NULL) +
+  theme_classic() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y  = element_blank())
+```
+
+## 2.5 The backward step (`find_opt_smt`)
+
+For each $t = T-1, T-2, \dots, 1$ (`backward_induction.R:180-183`), the function `find_opt_smt(t)` does the following.
+
+**Step A. Build the joint table.** Cartesian-product `base_data` (all $(s, \phi)$ cells) with the grid `W_ls`, producing one row per $(s,\phi,W_{it})$.
+
+**Step B. Compute next-period quota.** If $t$ is the last year of an allocation cycle (`(t %% alloc_year) == 0`),
+
+$$
+W_{next} \;=\; W_{total} \;+\;
+\begin{cases}
+\min(\tau\, W_{total},\, \eta\,(W_{it}-g)), & W_{it} - g \ge 0,\\[4pt]
+\gamma\,(W_{it}-g), & W_{it} - g < 0,
+\end{cases}
+$$
+
+otherwise $W_{next} = W_{it} - g$. Then clamp $W_{next}$ to $[W_{\min}, W_{\max}]$ so it remains inside the value-function grid.
+
+**Step C. Look up the continuation value.** If $t+1 = T$, evaluate the monotone spline $V_T$ at $W_{next}$. Otherwise snap $W_{next}$ to the nearest grid point in `W_ls` and merge with `opt_choice_ls[[t+1]]` to fetch $V_{t+1}(W_{next})$. (`backward_induction.R:138-156`.)
+
+**Step D. Optimize over SMT.** For each $(s, W_{it})$ compute the per-row total $p f - c g + \delta V_{t+1}(W_{next})$, take the empirical expectation over $\phi$, and select
+
+$$
+s_t^\star(W) \;=\; \arg\max_{s \in \mathcal S(W)} \mathbb E_\phi\!\left[\, p\, f(s,\phi) - c\, g(s,\phi) + \delta\, V_{t+1}(W'(W,s,\phi;y_t)) \,\right],
+$$
+
+storing both the maximizing SMT and the value $V_t(W)$ in `opt_choice_ls[[t]]`. (`backward_induction.R:161-173`.)
+
+The output for one parameter combination is a list `opt_choice_ls` of length $T-1$; each element is a data.table mapping $W$ to $(s_t^\star, V_t)$. The file name encodes the design parameters (`02-1-solve-DP.qmd:121-129`).
+
+## 2.6 Sweep over quota designs
+
+The outer loop (`02-1-solve-DP.qmd:111-227`) enumerates all combinations of $AQ$, $AL$, $\eta$, $\tau$, $\gamma$ from the parameter grids defined there, and runs `solve_BI` for each in parallel. "Case 1" restricts to $\eta = 1$ (full carry-over ratio) and varies $\tau$ (the cap).
+
+# Stage 3: Forward simulation
+
+## 3.1 Sample-path construction (`sim_path`)
+
+For one parameter combination, Stage 3 simulates $N$ independent farmers (`num_sim = 500{,}000` by default; 10,000 for the distribution figures), each over $T$ periods.
+
+Initial state:
+
+$$
+W_1^{(i)} \;=\; W_{total} \,+\, \text{endowment}, \qquad y_1^{(i)} = 1, \quad i = 1,\dots,N.
+$$
+
+Weather for every $(i, t)$ is drawn independently and uniformly with replacement from the 35 AquaCrop weather years (`simulate.R:194-199`):
+
+$$
+\phi_t^{(i)} \,\sim\, \mathrm{Unif}(\{1,\dots,35\}).
+$$
+
+The random seed is fixed at `set.seed(784343)` so the simulation is reproducible.
+
+## 3.2 Policy lookup
+
+In each period $k$ the simulator:
+
+1. Snaps $W_k^{(i)}$ to the closest grid point in `W_ls` via a rolling join (`simulate.R:226-230`). Call this $\tilde W_k^{(i)}$.
+2. Looks up the optimal SMT from `opt_choice_temp[[j(k)]]`, where the cycle-position index is
+
+   $$
+   j(k) \;=\; \begin{cases} AL, & k \bmod AL = 0,\\ k \bmod AL, & \text{otherwise.} \end{cases}
+   $$
+
+   Note that only the first $AL$ policy slices are ever used. The comment at `simulate.R:233-237` explains why: those slices are computed at periods $1,\dots,AL$ of the BI, which are the furthest from the terminal period, so the policy there is the closest to the stationary (infinite-horizon) policy within the allocation cycle.
+
+   For $AL = 3$ the cycle-position index $j(k)$ recycles through $1, 2, 3$ as $k$ advances:
+
+   ```{r cycle-index-example}
+   AL <- 3
+   data.table(
+     k        = 1:10,
+     k_mod_AL = (1:10) %% AL,
+     j_k      = ifelse((1:10) %% AL == 0, AL, (1:10) %% AL)
+   )
+   ```
+
+   So a simulator at $k = 7$ uses the optimal policy stored at $j(7) = 1$, identical to the one used at $k = 1$ and $k = 4$.
+
+3. Joins `base_data` on $(s_k^{(i),\star}, \phi_k^{(i)})$ to recover the realized yield $f$ and irrigation $g$ for that sample path in that period.
+
+## 3.3 State update
+
+Letting $w_k^{(i)} = g(s_k^{(i),\star},\, \phi_k^{(i)})$, the next-period quota is updated using the same rule as in BI:
+
+$$
+W_{k+1}^{(i)} \;=\;
+\begin{cases}
+\tilde W_k^{(i)} - w_k^{(i)}, & k \bmod AL \ne 0,\\[6pt]
+W_{total} \;+\; \mathbb{1}\{w_k^{(i)} \le \tilde W_k^{(i)}\}\cdot \min(\tau\, W_{total},\, \eta\,(\tilde W_k^{(i)} - w_k^{(i)}))
+\\\quad\quad +\; \mathbb{1}\{w_k^{(i)} > \tilde W_k^{(i)}\}\cdot \gamma\,(\tilde W_k^{(i)} - w_k^{(i)}),
+& k \bmod AL = 0,
+\end{cases}
+$$
+
+(`simulate.R:244-256`).
+
+## 3.4 Per-period profit and aggregation
+
+Realized profit per sample path per period is
+
+$$
+\pi_k^{(i)} \;=\; p\, f(s_k^{(i),\star},\phi_k^{(i)}) \;-\; c\, w_k^{(i)} \;-\; \lambda,
+\qquad \lambda = 600,
+$$
+
+(`simulate.R:277`). A binary `w_broke` flag records whether $W_{k}^{(i)} < 0$ (i.e., entered the period in a penalty state).
+
+When `summarize = TRUE` the simulator collapses the $N$ paths into per-period summaries (mean, quantiles q0/q25/q50/q75/q100) for yield, profit, and irrigation, plus the fraction of paths with $W_{start} < 0$. When `summarize = FALSE` (the distribution runs in `03-1-simulate.qmd:80-103`) the raw per-path output is kept so that distributions can be plotted.
+
+## 3.5 Experiment design in `03-1-simulate.qmd`
+
+Three batches are run on top of the Case 1 policy library:
+
+1. **Main run** (no initial endowment): every design in `qd_parameter_case_1.rds` with `endowment = 0`, summarized. Output: `results/Simulation/sim_results_all.rds`.
+2. **Endowment sweep**: a subset of designs (annual_quota = 10, alloc_year $\in \{1,3,5\}$) crossed with `endowment = 0,1,\dots,15` to trace how initial water on hand interacts with the design. Output: `results/sim_results_with_end.rds`.
+3. **Distribution run**: four corner designs (annual_quota = 10; alloc_year $\in \{1,7\}$; $\gamma \in \{1,2\}$; $\tau \in \{0,3\}$) with `num_sim = 10000` and `summarize = FALSE`, so that the full distribution of water use and profit can be visualized. Output: `results/sim_dist.rds`.
+
+# How the stages talk to each other
+
+The following object handoffs glue the pipeline together. Inspecting these files is enough to verify consistency between stages.
+
+| Produced in | Object | Consumed in |
+|---|---|---|
+| `01-data-prep.qmd` | `Data/yield_water_data_for_sim.rds` (per $(s,\phi)$ yield and irrigation on the frontier) | `02-1-solve-DP.qmd:34-46` and used as `base_data` in both BI and simulation |
+| `01-data-prep.qmd` | `Data/yield_water_data_for_summary.rds` (per-$s$ expectations) | `02-1-solve-DP.qmd:23-30` (to define `new_smt` ordering) |
+| `02-1-solve-DP.qmd` | `data/processed/global_parameters.RData` ($\delta, p, c$) | Stage 2 and Stage 3 |
+| `02-1-solve-DP.qmd` | `results/Profit_W_T.rds` (terminal-period payoff $\Pi(W)$) | `solve_BI` builds $V_T$ from it |
+| `02-1-solve-DP.qmd` | `results/parameter_set.rds`, `qd_parameter_case_1.rds` (the design grid) | Stage 3 to iterate experiments |
+| `solve_BI` | `results/optimal_choice/opt_choice_*.rds` (one per design; list of length $T-1$ of $(W, s^\star, V)$ tables) | Stage 3 policy lookup at `simulate.R:203-208` |
+| `sim_path` | `results/simulation/sim_results_*.rds` (summarized or raw paths) | Stage 4-5 summarization and figures (out of scope here) |
+
+# Caveats and design choices worth remembering
+
+1. **Action space is pre-pruned.** Only frontier SMTs in $\mathcal S^\star$ are considered everywhere downstream; sub-frontier SMTs are never re-evaluated.
+2. **Weather is i.i.d. with empirical distribution.** Both the BI expectation and the forward simulation draws come from the same 35-year AquaCrop panel, so there is no out-of-sample weather. Serial correlation across years is not modeled.
+3. **Quota grid and snapping.** The continuous state $W$ is discretized to `W_ls` and approximated by nearest-neighbor snapping at both BI and simulation stages. The break-point augmentation in 2.4 is what keeps this from smearing the kinks at penalty thresholds.
+4. **Terminal penalty.** The within-period $100 \cdot \min(0, W-g)$ term in $V_T$ is a numerical device, not a policy parameter; its influence on early-period BI iterations is negligible because of discounting and the smoothing spline.
+5. **Stationary policy approximation in simulation.** Although BI returns policies indexed by absolute period $t$, the simulator uses only periods $1,\dots,AL$ as the cycle policy. This is the cleanest available approximation to the infinite-horizon stationary policy and avoids horizon-end artifacts.
+6. **Cost level $\lambda$.** The $-\lambda$ term shifts levels of $\pi$ but never affects $\arg\max_s$, so it is omitted from BI and only added in the simulator output.
+
+# Code-equation cross reference (quick lookup)
+
+| Equation in this doc | Code location |
+|---|---|
+| Yield unit conversion (`/0.06`) | `01-data-prep.qmd:60` |
+| Irrigation unit conversion (`* 0.0393701`) | `01-data-prep.qmd:87` |
+| Expected $\bar f(s), \bar g(s)$ | `01-data-prep.qmd:69-72, 93-97` |
+| Frontier set $\mathcal S^\star$ | `01-data-prep.qmd:117-132` |
+| Profit definition $p f - c g$ | `02-1-solve-DP.qmd:43` |
+| Horizon `prod_T` | `backward_induction.R:48` |
+| $W_{\min}, W_{\max}$ | `backward_induction.R:57-58` |
+| Terminal payoff $\Pi(W)$ with penalty 100 | `find_max_e_pi`, `backward_induction.R:285-309` |
+| Spline for $V_T$ | `backward_induction.R:82` |
+| Break points $b_i$ | `get_break_poitns`, `backward_induction.R:262-279` |
+| Cycle-end quota transition (BI) | `backward_induction.R:94-102` |
+| Mid-cycle quota transition (BI) | `backward_induction.R:103-108` |
+| Continuation value lookup | `backward_induction.R:138-156` |
+| Bellman optimization step | `backward_induction.R:161-173` |
+| Sample path quota init | `simulate.R:180-189` |
+| Weather draw | `simulate.R:194-199` |
+| Policy lookup index $j(k)$ | `simulate.R:237` |
+| Cycle-end quota transition (sim) | `simulate.R:244-256` |
+| Realized profit with $\lambda = 600$ | `simulate.R:277` |
+| Per-period summaries | `simulate.R:281-308` |

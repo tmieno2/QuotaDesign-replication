@@ -1,0 +1,212 @@
+---
+title: Prepare data for backward induction and simulation
+---
+
+# Purpose
+
+Stage 1 of the pipeline. Turns the raw AquaCrop production-function output (yield and irrigation by SMT and weather year, produced by Timothy Foster) into two tidy long-form tables, and prunes the SMT decision space to a yield-irrigation frontier so the dynamic program in Stage 2 stays tractable. Also writes out the global economic parameters (prices, discount rate) used in Stages 2 and 3.
+
+# Inputs
+
++ `Data/AquaCropSimulations_October2017/ProductionFunction_October2017.mat`: original AquaCrop output (MATLAB .mat file). Two parallel matrices of size $|\mathcal{S}| \times |\Phi|$ (SMTs x weather years): one of yields, one of irrigation amounts.
+
+# Outputs
+
++ `data/processed/global_parameters.RData`: discount rate `sigma`, corn price `corn_P`, irrigation cost `ir_P`. Consumed by 02-1 and 03-1.
++ `data/processed/aq_raw_data.rds`: long-form table with one row per (smt, year) cell of yield and irrigation in (bu/acre, inches). Consumed by the worked example in 00-simulation-overview.
++ `Data/yield_water_data_for_sim.rds`: same long-form table, but restricted to the frontier SMTs. Loaded as `base_data` in 02-1 and 03-1.
++ `Data/yield_water_data_for_summary.rds`: per-SMT expectations (`e_yield`, `e_ir`, `bin`) restricted to the frontier. Used in 02-1 to define the `new_smt` ordering.
++ `writing/figures/g_ef_frontier.png`: scatter of all SMT means in (irrigation, yield) space with the frontier subset highlighted in red.
+
+# Pipeline position
+
+This file is run first. Stage 2 (02-1-solve-DP.qmd) reads the frontier dataset as `base_data`, and Stage 3 (03-1-simulate.qmd) reads the same file again for the simulator. Nothing in Stages 2 or 3 reaches back to non-frontier SMTs.
+
+# Key steps
+
+1. Save global economic parameters (discount rate, corn price, irrigation cost).
+2. Read AquaCrop's two production-function matrices and reshape each to long form, applying the bu/acre and inches unit conversions.
+3. Take the empirical expectation over weather years to get per-SMT mean yield and mean irrigation.
+4. Bin SMTs by mean irrigation in 0.05-inch bins and keep only the SMT with the highest mean yield in each bin (plus SMT 1, the rainfed action). This is the frontier $\mathcal S^\star$ described in 00-simulation-overview Section 1.3.
+5. Save the frontier subset and a frontier-overlay plot.
+
+# Glossary
+
++ SMT: soil moisture target
+
+# Global parameters
+
+Discount rate, corn price, and irrigation cost. Written to disk so the same numbers are reused without copy-paste in Stages 2 and 3.
+
+```{r}
+#--- discount rate ---#
+sigma <- 1 / (1 + 0.05)
+
+#--- prices ---#
+corn_P <- 4 # corn (bu/acre)
+ir_P <- 6 # irrigation ($/inch)
+
+save(sigma, corn_P, ir_P, file = here::here("data/processed/global_parameters.RData"))
+```
+
+# Water-yield data by AquaCrop
+
+Import the yield-irrigation data simulated by AquaCrop. This dataset was created by Timothy Foster.
+
+The .mat file contains a named struct; the top-level object `ProductionFunction.October2017` is a list whose first element is the yield matrix and second element is the irrigation matrix. Rows correspond to weather years (1 to 35), columns to SMTs.
+
+```{r }
+(
+  yield_water <- R.matlab::readMat(here::here("data/AquaCropSimulations_October2017/ProductionFunction_October2017.mat"))
+)
+```
+
+Pull the inner list out of the struct wrapper so subsequent chunks can index by position.
+
+```{r }
+(
+  yiedl_water_array <- yield_water$ProductionFunction.October2017
+)
+```
+
+## Extract and transform data by variable
+
+### Yield
+
+Yield is stored in element 1 of the list. The matrix is transposed so rows are SMTs, then melted to one row per (smt, year). The `/ 0.06` factor converts AquaCrop's native units to bu/acre.
+
+```{r yield}
+(
+  yield_data <-
+    yiedl_water_array[[1]] %>%
+    t() %>%
+    data.table() %>%
+    .[, smt := 1:nrow(.)] %>%
+    melt(id.var = "smt") %>%
+    setnames(c("variable", "value"), c("year", "yield")) %>%
+    .[, yield := yield / 0.06] %>%
+    .[, year := as.numeric(gsub("V", "", year))] %>%
+    setkey(smt, year)
+)
+```
+
+Per-SMT expected yield $\bar f(s)$, taking the empirical mean over the 35 weather years.
+
+```{r}
+e_yield <-
+  yield_data[, .(e_yield = mean(yield)), by = smt] %>%
+  setkey(smt)
+```
+
+### Irrigation
+
+Irrigation is element 2 of the list. Same reshape pattern as yield. The `* 0.0393701` factor converts from millimeters (AquaCrop's native unit) to inches.
+
+```{r irrigation}
+irr_data <-
+  yiedl_water_array[[2]] %>%
+  t() %>%
+  data.table() %>%
+  .[, smt := 1:nrow(.)] %>%
+  melt(id.var = "smt") %>%
+  setnames(c("variable", "value"), c("year", "ir")) %>%
+  .[, year := as.numeric(gsub("V", "", year))] %>%
+  .[, ir := ir * 0.0393701] %>%
+  setkey(smt, year)
+```
+
+Per-SMT expected irrigation $\bar g(s)$.
+
+```{r }
+e_ir <-
+  irr_data[, .(e_ir = mean(ir)), by = smt] %>%
+  setkey(smt)
+```
+
+### Combine and save
+
+Join the long-form yield and irrigation tables on (smt, year), and join their per-SMT expectations on smt. `raw_data` is the per-cell table consumed by Stages 2 and 3, and the basis for the worked example in 00-simulation-overview.
+
+```{r raw data}
+raw_data <- yield_data[irr_data, on = c("smt", "year")]
+
+e_data <- e_yield[e_ir, on = "smt"]
+```
+
+```{r}
+saveRDS(raw_data, here::here("data/processed/aq_raw_data.rds"))
+```
+
+## Find SMTs that are on the yield frontier
+
+Find the SMTs that are around the yield-water production frontier and remove that are consistently suboptimal. This reduces the computation speed later in backward induction and simulation.
+
+The observations are binned based on the value of expected irrigation, where the bin width is 0.05 inches. Then, for each of the bin, identify the SMT that has the highest expected yield.
+
+Build 0.05-inch-wide irrigation bins, label each SMT by the bin its mean irrigation falls into, then pick the SMT with the highest mean yield in each bin. SMT 1 (rainfed, the only feasible choice when the quota is exhausted) is appended unconditionally. The result is the frontier set $\mathcal S^\star$ that becomes the entire decision space downstream.
+
+```{r }
+seq_bin <- seq(min(e_data[, e_ir]), max(e_data[, e_ir]) + 0.1, by = 0.05)
+bins_len <- length(seq_bin)
+
+e_data[, bin := 1]
+for (i in 1:bins_len) {
+  e_data[seq_bin[i] < e_ir & seq_bin[i + 1] > e_ir, bin := i]
+}
+
+smt_at_frontier <-
+  e_data[, .SD[e_yield == max(e_yield), ], by = bin] %>%
+  unique(by = "e_yield") %>%
+  .[, smt] %>%
+  #--- include smt = 1, which is dryland production  ---#
+  c(., 1)
+```
+
+Plot all SMT means in grey and overlay the frontier in red. Saved as a figure in the manuscript folder.
+
+```{r}
+g_ef_frontier <-
+  ggplot() +
+  geom_point(
+    data = e_data,
+    aes(y = e_yield, x = e_ir),
+    size = 0.4,
+    color = "grey"
+  ) +
+  geom_point(
+    data = e_data[smt %in% smt_at_frontier],
+    aes(y = e_yield, x = e_ir),
+    color = "red",
+    size = 0.4
+  ) +
+  theme_bw() +
+  xlab("Average Irrigation Amount (inches)") +
+  ylab("Average Corn Yield (bu/acre)")
+
+ggsave(
+  here::here("writing/figures/g_ef_frontier.png"),
+  g_ef_frontier,
+  dpi = 300,
+  height = 4,
+  width = 6
+)
+```
+
+Restrict the per-cell and per-SMT tables to the frontier. From here on, downstream stages never see sub-frontier SMTs.
+
+```{r }
+data_for_sim <- raw_data[smt %in% smt_at_frontier, ]
+data_for_summary <- e_data[smt %in% smt_at_frontier, ]
+```
+
+## Save
+
+Save both frontier datasets. `yield_water_data_for_sim.rds` becomes `base_data` in Stages 2 and 3; `yield_water_data_for_summary.rds` carries the bin labels and per-SMT expectations used to re-index SMTs in 02-1.
+
+```{r }
+saveRDS(data_for_sim, here::here("data/yield_water_data_for_sim.rds"))
+saveRDS(data_for_summary, here::here("data/yield_water_data_for_summary.rds"))
+```
+
+
+

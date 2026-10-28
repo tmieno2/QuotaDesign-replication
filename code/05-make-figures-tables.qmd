@@ -1,0 +1,1136 @@
+---
+title: Make figures for illustrating the results
+---
+
+# Purpose
+
+Produces the manuscript and presentation figures from the Stage 3 simulation outputs and the policy/regulation summary tables for Nebraska NRDs and Kansas water districts. Every figure has both an "Article" version (small fonts, 6.5 inch wide) and a "Presentation" version (large fonts, 12 inch wide).
+
+# Inputs
+
++ `results/simulation/sim_results_all.rds`: main simulation result from 03-1.
++ `results/sim_results_with_end.rds`: endowment-sweep result from 03-1.
++ `results/sim_dist.rds`: distribution-batch result from 03-1.
+
+# Outputs
+
+Figures (PNG, written to `writing/figures/` or `Presentation/`):
+
++ `path_AQ_10_pen_2_co_varied.png` (+ `_presentation.png`): per-period profit / irrigation / banked-quota path, $AQ = 10$, $\gamma = 2$, varying $\tau$.
++ `path_AQ_10_pen_2_al_varied_presentation.png`: same scenario at $\tau = 0$, varying allocation length only.
++ `path_AQ_10_co_1_pen_varied.png` (+ `_presentation.png`): same panel with $\tau = 3$ and varying $\gamma$.
++ `g_ef_frontier_co.png` (+ `_presentation.png`): efficiency frontier, expected profit vs. irrigation in years 1-30, colored by $\tau$.
++ `g_ef_frontier_apl.png`: same, colored by allocation-period length.
++ `g_ef_frontier_pen.png`: same, colored by $\gamma$.
++ `g_ex_end.png` (+ `_presentation.png`): example path under different initial endowments.
++ `g_value_endowment.png` (+ `_presentation.png`): 50-year total value of the initial endowment vs. $\tau$.
++ `g_variability.png` (+ `_presentation.png`): ridgeline distributions of irrigation and profit by year for two corner designs.
++ `qd_table_NE.png` (+ `_presentation.png`): Nebraska NRD quota-design summary table.
++ `qd_table_KS.png`: Kansas IGUCA/LEMA/voluntary quota-design summary table.
++ `path_AQ_8_pen_2_co_varied.png`, `path_AQ_12_pen_2_co_varied.png`: appendix paths for $AQ = 8$ and $AQ = 12$.
+
+Saved data tables:
+
++ `results/efficiency_plot_data.rds`: per-design first-30-year averages used to draw the efficiency-frontier panels.
++ `results/dist_results_year_10.rds`: trimmed long-form version of `sim_dist.rds` for the variability ridgelines.
++ `results/end_value.rds`: per-design 50-year value of each endowment level.
+
+# Pipeline position
+
+This is the figure factory for the manuscript and the presentation. It depends only on Stage 3 outputs (no recomputation of policies). 04-1 and 04-2 are exploratory siblings; A-1-additional-figures.qmd adds further appendix figures.
+
+# Key steps
+
+1. Load main, endowment, and distribution simulation results.
+2. Define a shared `theme_ef` for article-sized figures.
+3. **Path plots**: paths of profit, irrigation, and banked quota for `(AQ, pen_ratio, max_co_ratio)` slices, in both article and presentation styles.
+4. **Efficiency frontier**: per-design first-30-year averages, scatter in (irrigation, profit) plane, colored by $\tau$, $\gamma$, or allocation length.
+5. **Endowment effects**: example path with different starting endowments and the per-design value of the endowment.
+6. **Distribution figure**: ridgeline densities of irrigation and profit by year for $\tau \in \{0, 3\}$.
+7. **Tables**: Nebraska NRD and Kansas LEMA/IGUCA quota-design tables built with `flextable`.
+8. **Appendix figures**: a function `gen_results_figures(aq)` reusable for any annual quota; called for $AQ = 8$ and $AQ = 12$.
+
+# Preparation
+
+## Packages
+
+```{r}
+#| label: packages
+#| include: false
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(ggthemes)
+library(ggridges)
+library(viridis)
+library(flextable)
+library(officer)
+```
+
+## Load simulation results
+
+Main simulation output from 03-1. Every figure block below filters and reshapes this object before plotting.
+
+```{r}
+sim_results <- readRDS(here::here("results/simulation/sim_results_all.rds"))
+```
+
+## Set up a theme
+
+Shared ggplot theme. The presentation chunks below add a larger-font overlay on top.
+
+```{r}
+theme_ef <-
+  theme_bw() +
+  theme(
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 7),
+    strip.text = element_text(size = 9),
+    legend.title = element_text(size = 9, vjust = 0.5),
+    strip.background = element_rect(fill = "white", color = NA),
+    legend.position = "bottom"
+  )
+```
+
+# Path
+
+## Entire Path (AQ = 10 and pen_ratio == 2, max_co_ratio varied)
+
+This block builds a long-form path table for $AQ = 10$, $\gamma = 2$ across five values of $\tau$, averages per allocation cycle, derives banked quota as $(W_{start} - AL \cdot 10)/AL$ (subtracting the within-cycle base quota so the banked component is isolated), then plots profit / irrigation / banked-quota in three rows by allocation-period length in columns.
+
+### Article
+
+```{r}
+path_data <-
+  sim_results %>%
+  .[annual_quota == 10, ] %>%
+  .[pen_ratio == 2, ] %>%
+  .[max_co_ratio %in% c(0, 0.5, 1, 2, 3), ] %>%
+  .[, `:=`(profit = mean(profit), ir = mean(ir)), by = .(alloc_period, annual_quota, max_co_ratio, pen_ratio, alloc_year)] %>%
+  .[, w_start := (max(W_start) - 10 * alloc_year) / alloc_year, by = .(alloc_period, annual_quota, max_co_ratio, pen_ratio, alloc_year)] %>%
+  .[, .(profit, ir, w_start, period, alloc_period, max_co_ratio, alloc_year)] %>%
+  data.table::melt(id.vars = c("period", "alloc_period", "max_co_ratio", "alloc_year"), measure.vars = c("profit", "ir", "w_start")) %>%
+  .[, variable_text := case_when(
+    variable == "profit" ~ "Profit ($/acre)",
+    variable == "ir" ~ "Irrigation (inches)",
+    variable == "w_start" ~ "Banked Quota (inches)"
+  )] %>%
+  .[, alloc_year_txt := paste("Allocation period: ", alloc_year, " year(s)", sep = "")] %>%
+  .[, variable_text := factor(variable_text, levels = c("Profit ($/acre)", "Irrigation (inches)", "Banked Quota (inches)"))]
+
+(
+  g_AQ_10_pen_2_co_varied <-
+    ggplot(data = path_data) +
+    geom_line(aes(y = value, x = period, color = factor(max_co_ratio))) +
+    facet_grid(variable_text ~ alloc_year_txt, scales = "free", switch = "y") +
+    scale_color_viridis_d(
+      name = "Maximum Carry-over Ratio",
+      option = "rocket",
+      direction = -1,
+      end = 0.9
+    ) +
+    xlab("Year") +
+    ylab("") +
+    scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50)) +
+    theme_ef +
+    theme(
+      strip.placement = "outside"
+    )
+)
+
+ggsave(
+  g_AQ_10_pen_2_co_varied,
+  file = here::here("writing/figures/path_AQ_10_pen_2_co_varied.png"),
+  width = 6.5,
+  height = 6,
+  dpi = 600
+)
+```
+
+### Presentation
+
+#### Allocation period length only
+
+Restrict `path_data` to $\tau = 0$ so the only design variation is the allocation length, then enlarge fonts for projection.
+
+```{r}
+(
+  g_AQ_10_pen_2_al_varied <-
+    path_data[max_co_ratio == 0] %>%
+    .[, variable_text := case_when(
+      variable_text == "Profit ($/acre)" ~ "Profit ($/acre)",
+      variable_text == "Irrigation (inches)" ~ "Irrigation\n (inches)",
+      variable_text == "Banked Quota (inches)" ~ "Banked Quota\n (inches)"
+    )] %>%
+    .[, variable_text := factor(variable_text, levels = c("Profit ($/acre)", "Irrigation\n (inches)", "Banked Quota\n (inches)"))] %>%
+    ggplot(data = .) +
+    geom_line(aes(y = value, x = period), linewidth = 1) +
+    facet_grid(variable_text ~ alloc_year_txt, scales = "free", switch = "y") +
+    scale_color_viridis_d(
+      name = "Maximum Carry-over Ratio",
+      option = "rocket",
+      direction = -1,
+      end = 0.9
+    ) +
+    xlab("Year") +
+    ylab("") +
+    scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50)) +
+    theme_ef +
+    theme(
+      strip.placement = "outside"
+    ) +
+    theme(
+      axis.title.x = element_text(size = 20),
+      axis.title.y = element_text(size = 20),
+      axis.text = element_text(size = 20),
+      strip.text = element_text(size = 20),
+      legend.text = element_text(size = 20),
+      legend.title = element_text(size = 20)
+    )
+)
+
+ggsave(
+  g_AQ_10_pen_2_al_varied,
+  file = here::here("writing/figures/path_AQ_10_pen_2_al_varied_presentation.png"),
+  width = 12,
+  height = 7.2,
+  dpi = 300
+)
+```
+
+#### Allocation period length and carry-over ratio
+
+Same article figure as above, now with the full set of $\tau$ values and larger fonts. `copy(path_data)` keeps the column-renaming in this chunk from leaking into earlier objects.
+
+```{r}
+g_AQ_10_pen_2_co_varied_presentation <-
+  copy(path_data) %>%
+  .[, variable_text := case_when(
+    variable_text == "Profit ($/acre)" ~ "Profit ($/acre)",
+    variable_text == "Irrigation (inches)" ~ "Irrigation\n (inches)",
+    variable_text == "Banked Quota (inches)" ~ "Banked Quota\n (inches)"
+  )] %>%
+  .[, variable_text := factor(variable_text, levels = c("Profit ($/acre)", "Irrigation\n (inches)", "Banked Quota\n (inches)"))] %>%
+  ggplot(data = .) +
+  geom_line(aes(y = value, x = period, color = factor(max_co_ratio)), linewidth = 1.5) +
+  facet_grid(variable_text ~ alloc_year_txt, scales = "free", switch = "y") +
+  scale_color_viridis_d(
+    name = "Maximum Carry-over Ratio",
+    option = "rocket",
+    direction = -1,
+    end = 0.9
+  ) +
+  xlab("Year") +
+  ylab("") +
+  scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50)) +
+  theme_ef +
+  theme(
+    strip.placement = "outside"
+  ) +
+  theme(
+    axis.title.x = element_text(size = 20),
+    axis.title.y = element_text(size = 20),
+    axis.text = element_text(size = 20),
+    strip.text = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 20)
+  )
+
+ggsave(
+  g_AQ_10_pen_2_co_varied_presentation,
+  file = here::here("writing/figures/path_AQ_10_pen_2_co_varied_presentation.png"),
+  width = 12,
+  height = 7.2,
+  dpi = 300
+)
+```
+
+## Entire Path (`AQ = 10` and `max_co_ratio == 1`, `pen_ratio` varied)
+
+This figure presents the path of profit, irrigation, and water stock in the first 30 years. For each allocation period, those metrics are averaged to avoid displaying oscillative cycles, which is merely a disturbance.
+
+Same structure as the path block above, but fixing $\tau = 3$ and varying $\gamma \in \{1, 1.5, 2\}$ instead of $\tau$. The section header says `max_co_ratio == 1` but the code filters `max_co_ratio == 3`; the code is the source of truth.
+
+```{r}
+path_data_AQ_10_co_1_pen_varied <-
+  sim_results %>%
+  .[annual_quota == 10, ] %>%
+  .[pen_ratio %in% c(1, 1.5, 2), ] %>%
+  .[max_co_ratio == 3, ] %>%
+  .[, `:=`(profit = mean(profit), ir = mean(ir)), by = .(alloc_period, annual_quota, max_co_ratio, pen_ratio, alloc_year)] %>%
+  .[, w_start := (max(W_start) - 10 * alloc_year) / alloc_year, by = .(alloc_period, annual_quota, max_co_ratio, pen_ratio, alloc_year)] %>%
+  .[, .(profit, ir, w_start, period, alloc_period, pen_ratio, alloc_year)] %>%
+  data.table::melt(id.vars = c("period", "alloc_period", "pen_ratio", "alloc_year"), measure.vars = c("profit", "ir", "w_start")) %>%
+  .[, variable_text := case_when(
+    variable == "profit" ~ "Profit ($/acre)",
+    variable == "ir" ~ "Irrigation\n (inches)",
+    variable == "w_start" ~ "Banked Quota\n (inches)"
+  )] %>%
+  .[, alloc_year_txt := paste("Allocation period: ", alloc_year, " year(s)", sep = "")] %>%
+  .[, variable_text := factor(variable_text, levels = c("Profit ($/acre)", "Irrigation\n (inches)", "Banked Quota\n (inches)"))]
+
+(
+  g_AQ_10_co_1_pen_varied <-
+    ggplot(data = path_data_AQ_10_co_1_pen_varied) +
+    geom_line(aes(y = value, x = period, color = factor(pen_ratio))) +
+    facet_grid(variable_text ~ alloc_year_txt, scales = "free", switch = "y") +
+    scale_color_viridis_d(
+      name = "Penalty Multiplier",
+      option = "rocket",
+      direction = -1,
+      end = 0.9
+    ) +
+    xlab("Year") +
+    ylab("") +
+    scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50)) +
+    theme_ef +
+    theme(
+      strip.placement = "outside"
+    )
+)
+
+ggsave(
+  g_AQ_10_co_1_pen_varied,
+  file = here::here("writing/figures/path_AQ_10_co_1_pen_varied.png"),
+  width = 6.5,
+  height = 6,
+  dpi = 600
+)
+
+
+```
+
+### Presentation
+
+```{r}
+g_AQ_10_co_1_pen_varied_presentation <-
+  g_AQ_10_co_1_pen_varied +
+  geom_line(aes(y = value, x = period, color = factor(pen_ratio)), linewidth = 1.5) +
+  theme(
+    axis.title.x = element_text(size = 20),
+    axis.title.y = element_text(size = 20),
+    axis.text = element_text(size = 20),
+    strip.text = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 20)
+  )
+
+ggsave(
+  g_AQ_10_co_1_pen_varied_presentation,
+  file = here::here("writing/figures/path_AQ_10_co_1_pen_varied_presentation.png"),
+  width = 12,
+  height = 7.2,
+  dpi = 300
+)
+```
+
+# Cumulative water-use trajectories at a representative frontier point
+
+This figure provides empirical support for the conditioning argument in Section 4.3.1 of the main manuscript: that designs at the same long-term average water use produce approximately the same cumulative water-use trajectory across the 50-year simulation horizon, not just at its endpoint.
+
+We identify two designs that sit at essentially the same point on the cost-effectiveness frontier near 9 inches of mean annual irrigation but on opposite ends of the profit dimension: a full-carry-over design (max_co_ratio = 3) and a no-carry-over design (max_co_ratio = 0). For each design we cumulatively sum the per-year mean irrigation produced by the Monte Carlo simulation in 03-1, then plot the two cumulative paths against the year.
+
+```{r}
+cum_pair_data <-
+  sim_results %>%
+  .[period <= 50, ] %>%
+  .[(annual_quota == 9.25 & alloc_year == 5 & max_co_ratio == 3 & pen_ratio == 2.0) |
+    (annual_quota == 9.50 & alloc_year == 3 & max_co_ratio == 0 & pen_ratio == 1.0), ] %>%
+  .[order(period), ] %>%
+  .[, cum_ir := cumsum(ir), by = .(annual_quota, alloc_year, max_co_ratio, pen_ratio)] %>%
+  .[, design := factor(fifelse(max_co_ratio == 3, "eff", "ineff"), levels = c("eff", "ineff"))]
+
+cum_pair_eff_label   <-
+  bquote("Most-efficient (full carry-over) (" *
+           AQ == 9.25 * "," ~ AL == 5 * "," ~ tau == 3 * "," ~ gamma == 2 * ")")
+cum_pair_ineff_label <-
+  bquote("Least-efficient (no carry-over) (" *
+           AQ == 9.5 * "," ~ AL == 3 * "," ~ tau == 0 * "," ~ gamma == 1 * ")")
+
+cum_pair_cols <- viridisLite::rocket(2, direction = -1, end = 0.9)
+
+(
+  g_cumulative_paths <-
+    ggplot(cum_pair_data, aes(x = period, y = cum_ir, color = design)) +
+    geom_line(linewidth = 0.7) +
+    scale_color_manual(
+      name = NULL,
+      values = setNames(cum_pair_cols, c("eff", "ineff")),
+      labels = c(eff = cum_pair_eff_label, ineff = cum_pair_ineff_label)
+    ) +
+    scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50)) +
+    xlab("Year") +
+    ylab("Cumulative water use (inches)") +
+    theme_ef +
+    theme(
+      legend.position = "bottom",
+      legend.direction = "vertical"
+    )
+)
+
+ggsave(
+  g_cumulative_paths,
+  file = here::here("writing/figures/g_cumulative_paths.png"),
+  width = 6.5,
+  height = 5,
+  dpi = 300
+)
+```
+
+### Presentation
+
+```{r}
+g_cumulative_paths_presentation <-
+  ggplot(cum_pair_data, aes(x = period, y = cum_ir, color = design)) +
+  geom_line(linewidth = 1.5) +
+  scale_color_manual(
+    name = NULL,
+    values = setNames(cum_pair_cols, c("eff", "ineff")),
+    labels = c(eff = cum_pair_eff_label, ineff = cum_pair_ineff_label)
+  ) +
+  scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50)) +
+  xlab("Year") +
+  ylab("Cumulative water use (inches)") +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "vertical",
+    axis.title.x = element_text(size = 20),
+    axis.title.y = element_text(size = 20),
+    axis.text = element_text(size = 20),
+    legend.text = element_text(size = 18),
+    strip.background = element_rect(fill = "white", color = NA)
+  )
+
+ggsave(
+  g_cumulative_paths_presentation,
+  file = here::here("writing/figures/g_cumulative_paths_presentation.png"),
+  width = 12,
+  height = 7.2,
+  dpi = 300
+)
+```
+
+# Efficiency frontier (first 30 years)
+
+This figure shows the expected annual profit against expected annual irrigation for the first 30 years of the regulation for various designs.
+
+## Prepare data
+
+Average the first 30 simulation years per design, then restrict to designs with average irrigation between 8 and 11 inches. The cached file is read back in some downstream contexts so each efficiency-frontier panel does not have to recompute the aggregation.
+
+```{r}
+ef_plot_data <-
+  sim_results %>%
+  .[period <= 30, ] %>%
+  .[, .(
+    ir = mean(ir),
+    profit = mean(profit),
+    w_broke = mean(W_broke),
+    w_start = mean(W_start),
+    yield = mean(yield),
+    yield_sd = mean(yield_sd)
+  ), by = .(annual_quota, max_co_ratio, pen_ratio, alloc_year)] %>%
+  .[ir >= 8 & ir <= 11, ]
+
+saveRDS(ef_plot_data, here::here("results/efficiency_plot_data.rds"))
+```
+
+
+
+## 8-11 only (by max carry-over ratio)
+
+Scatter in (irrigation, profit) space colored by $\tau$. Each point is one design.
+
+### Article
+
+```{r}
+(
+  g_ef_frontier_co <-
+    ggplot(data = ef_plot_data) +
+    geom_point(aes(y = profit, x = ir, color = factor(max_co_ratio)), size = 1) +
+    # scale_color_brewer(
+    #   name = "Maximum Carry-over Ratio",
+    #   palette = "Spectral"
+    # ) +
+    scale_color_viridis_d(
+      name = "Maximum Carry-over Ratio",
+      direction = -1
+    ) +
+    xlab("Average Annual Irrigation (inches)") +
+    ylab("Average Annual Profit ($/acre)") +
+    theme_ef +
+    guides(
+      colour = guide_legend(override.aes = list(size = 3))
+    )
+)
+
+ggsave(
+  g_ef_frontier_co,
+  file = here::here("writing/figures/g_ef_frontier_co.png"),
+  width = 6,
+  height = 5,
+  dpi = 600
+)
+```
+
+### Presentation
+
+```{r}
+(
+  g_ef_frontier_co_presentation <-
+    ggplot(data = ef_plot_data) +
+    geom_point(aes(y = profit, x = ir, color = factor(max_co_ratio)), size = 2.5) +
+    # scale_color_brewer(
+    #   name = "Maximum Carry-over Ratio",
+    #   palette = "Spectral"
+    # ) +
+    scale_color_viridis_d(
+      name = "Maximum Carry-over Ratio",
+      direction = -1
+    ) +
+    xlab("Average Annual Irrigation (inches)") +
+    ylab("Average Annual Profit ($/acre)") +
+    theme_ef +
+    guides(
+      colour = guide_legend(override.aes = list(size = 3))
+    ) +
+    theme(
+      axis.title.x = element_text(size = 20),
+      axis.title.y = element_text(size = 20),
+      axis.text = element_text(size = 20),
+      strip.text = element_text(size = 20),
+      legend.text = element_text(size = 20),
+      legend.title = element_text(size = 20)
+    )
+)
+
+ggsave(
+  g_ef_frontier_co_presentation,
+  file = here::here("writing/figures/g_ef_frontier_co_presentation.png"),
+  width = 12,
+  height = 7.2,
+  dpi = 300
+)
+```
+
+
+## 8-11 only (by allocation period length)
+
+Same scatter, recolored by $AL$. Brewer Spectral palette for the discrete allocation lengths.
+
+```{r}
+(
+  g_ef_frontier_apl <-
+    ggplot(data = ef_plot_data) +
+    geom_point(aes(y = profit, x = ir, color = factor(alloc_year)), size = 0.2) +
+    scale_color_brewer(
+      name = "Allocation Period \nLength (years)",
+      palette = "Spectral"
+    ) +
+    xlab("Average Annual Irrigation (inches)") +
+    ylab("Average Annual Profit ($/acre)") +
+    theme_ef +
+    guides(
+      colour = guide_legend(override.aes = list(size = 3))
+    )
+)
+ggsave(
+  g_ef_frontier_apl,
+  file = here::here("writing/figures/g_ef_frontier_apl.png"),
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+```
+
+## 8-11 only (by penalty ratio)
+
+Same scatter, recolored by $\gamma$.
+
+```{r}
+(
+  g_ef_frontier_pen <-
+    ggplot(data = ef_plot_data) +
+    geom_point(aes(y = profit, x = ir, color = factor(pen_ratio)), size = 0.2) +
+    scale_color_brewer(
+      name = "Penalty Multiplier",
+      palette = "Spectral"
+    ) +
+    xlab("Average Annual Irrigation (inches)") +
+    ylab("Average Annual Profit ($/acre)") +
+    theme_ef +
+    guides(
+      colour = guide_legend(override.aes = list(size = 3))
+    )
+)
+
+ggsave(
+  g_ef_frontier_pen,
+  file = here::here("writing/figures/g_ef_frontier_pen.png"),
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+```
+
+
+# The impact of quota endowment at the beginning
+
+Load the simulation results with endowment:
+
+```{r}
+sim_results_with_end <- readRDS(here::here("results/sim_results_with_end.rds"))
+```
+
+## Example path
+
++ allocation period: 1 year
++ maximum carry-over ratio: 3
++ penalty multiplier: 2
+
+One-design illustration of how the initial endowment is drawn down over time. Subtract 10 from `W_start` to isolate banked quota above the within-period base ($AQ = 10$). Endowments shown: $\{0, 5, 10, 15\}$ inches; horizon trimmed to 20 years.
+
+```{r}
+plot_data_ex_end <-
+  sim_results_with_end %>%
+  .[, banked_W := W_start - 10] %>%
+  .[alloc_year == 1, ] %>%
+  .[max_co_ratio == 3, ] %>%
+  .[pen_ratio == 2, ] %>%
+  .[endowment %in% c(0, 5, 10, 15), ] %>%
+  .[, .(profit, ir, banked_W, endowment, period)] %>%
+  melt(id.vars = c("endowment", "period")) %>%
+  .[, type := case_when(
+    variable == "profit" ~ "Profit ($/acre)",
+    variable == "banked_W" ~ "Banked Quota (inches)",
+    variable == "ir" ~ "Irrigation (inches)"
+  )] %>%
+  .[, type := factor(type, levels = c("Profit ($/acre)", "Irrigation (inches)", "Banked Quota (inches)"))]
+
+(
+  g_ex_end <-
+    ggplot(data = plot_data_ex_end[period <= 20, ]) +
+    geom_line(aes(y = value, x = period, color = factor(endowment))) +
+    facet_grid(
+      type ~ .,
+      scales = "free_y"
+    ) +
+    scale_color_viridis_d(
+      name = "Quota Endowment (inches)",
+      option = "rocket",
+      direction = -1,
+      end = 0.9
+    ) +
+    xlab("Year") +
+    ylab("") +
+    scale_x_continuous(breaks = c(1, 5, 10, 15, 20)) +
+    theme_ef +
+    theme(
+      strip.placement = "outside"
+    )
+)
+
+ggsave(
+  here::here("writing/figures/g_ex_end.png"), g_ex_end,
+  height = 5,
+  width = 5,
+  dpi = 300
+)
+```
+
+### Presentation
+
+Large-font version of the example-path panel. The `\n` line breaks in the facet labels are reinserted so two-line strip labels fit in projected slides.
+
+```{r}
+plot_data_ex_end_presentation <-
+  copy(plot_data_ex_end) %>%
+  .[, type := case_when(
+    type == "Profit ($/acre)" ~ "Profit ($/acre)",
+    type == "Irrigation (inches)" ~ "Irrigation\n (inches)",
+    type == "Banked Quota (inches)" ~ "Banked Quota\n (inches)"
+  )] %>%
+  .[, type := factor(type, levels = c("Profit ($/acre)", "Irrigation\n (inches)", "Banked Quota\n (inches)"))]
+
+(
+  g_ex_end_presentation <-
+    ggplot(data = plot_data_ex_end_presentation[period <= 20, ]) +
+    geom_line(aes(y = value, x = period, color = factor(endowment)), linewidth = 1.5) +
+    facet_grid(
+      type ~ .,
+      scales = "free_y"
+    ) +
+    scale_color_viridis_d(
+      name = "Quota Endowment (inches)",
+      option = "rocket",
+      direction = -1,
+      end = 0.9
+    ) +
+    xlab("Year") +
+    ylab("") +
+    scale_x_continuous(breaks = c(1, 5, 10, 15, 20)) +
+    theme_ef +
+    theme(
+      strip.placement = "outside",
+      axis.title.x = element_text(size = 20),
+      axis.title.y = element_text(size = 20),
+      axis.text = element_text(size = 20),
+      strip.text = element_text(size = 20),
+      legend.text = element_text(size = 20),
+      legend.title = element_text(size = 20)
+    )
+)
+
+ggsave(
+  here::here("writing/figures/g_ex_end_presentation.png"), g_ex_end_presentation,
+  width = 12,
+  height = 7.2,
+  dpi = 300
+)
+```
+
+## The value of endowment
+
+Per-design 50-year total profit (undiscounted sum over the first 50 years, the same horizon as the other dollar totals in the manuscript) at each endowment level, minus the same total at `endowment = 0`. The difference `end_value` is the dollar value of a one-time endowment of additional water. Saved to disk.
+
+```{r}
+all_profit_results <-
+  sim_results_with_end[period <= 50, .(tot_profit = sum(profit)), by = .(annual_quota, alloc_year, max_co_ratio, pen_ratio, endowment)]
+
+zero_end_results <-
+  all_profit_results[endowment == 0, ] %>%
+  setnames("tot_profit", "base_profit") %>%
+  .[, endowment := NULL]
+
+
+non_zero_end_results <- all_profit_results[endowment != 0, ]
+
+dif_results <-
+  zero_end_results[non_zero_end_results, on = .(annual_quota, alloc_year, max_co_ratio, pen_ratio)] %>%
+  .[, end_value := tot_profit - base_profit]
+
+saveRDS(dif_results, here::here("results/end_value.rds"))
+
+plot_data <-
+  dif_results %>%
+  .[endowment %in% c(0, 5, 10, 15), ] %>%
+  .[pen_ratio %in% c(1, 1.5, 2), ] %>%
+  .[max_co_ratio %in% c(0, 0.5, 1, 1.5, 2, 3), ] %>%
+  .[, pen_ratio_txt := paste0("Penalty Multiplier: ", pen_ratio)] %>%
+  .[, alloc_year_txt := paste0("Allocation period: ", alloc_year, " year(s)")]
+
+(
+  g_value_endowment <-
+    ggplot(plot_data) +
+    geom_line(aes(y = end_value, x = max_co_ratio, color = factor(endowment))) +
+    geom_point(aes(y = end_value, x = max_co_ratio, color = factor(endowment))) +
+    facet_grid(pen_ratio_txt ~ alloc_year_txt) +
+    scale_color_viridis_d(
+      name = "Initial Quota Endowment (inches)",
+      option = "rocket",
+      direction = -1,
+      end = 0.9
+    ) +
+    scale_x_continuous(breaks = c(0, 0.5, 1, 1.5, 2, 3)) +
+    scale_y_continuous(breaks = seq(0, 300, by = 50)) +
+    xlab("Maximum carry-over ratio") +
+    ylab("Total value of the initial endowment ($/acre)") +
+    theme_ef
+)
+
+
+ggsave(here::here("writing/figures/g_value_endowment.png"), g_value_endowment, height = 6, width = 6, dpi = 600)
+```
+
+### Presentation
+
+```{r}
+(
+  g_value_endowment_presentation <-
+    plot_data %>%
+    .[, pen_ratio_txt := paste0("PM =  ", pen_ratio)] %>%
+    ggplot(data = .) +
+    geom_line(
+      aes(y = end_value, x = max_co_ratio, color = factor(endowment)),
+      linewidth = 1.2
+    ) +
+    geom_point(
+      aes(y = end_value, x = max_co_ratio, color = factor(endowment)),
+      size = 1.2
+    ) +
+    facet_grid(pen_ratio_txt ~ alloc_year_txt) +
+    scale_color_viridis_d(
+      name = "Initial Quota Endowment (inches)",
+      option = "rocket",
+      direction = -1,
+      end = 0.9
+    ) +
+    scale_x_continuous(breaks = c(0, 0.5, 1, 1.5, 2, 3)) +
+    scale_y_continuous(breaks = seq(0, 300, by = 100)) +
+    xlab("Maximum carry-over ratio") +
+    ylab("Total value of the initial endowment ($/acre)") +
+    theme_bw() +
+    theme(
+      legend.position = "bottom",
+      axis.title.x = element_text(size = 20),
+      axis.title.y = element_text(size = 20),
+      axis.text = element_text(size = 20),
+      strip.text = element_text(size = 20),
+      legend.text = element_text(size = 20),
+      legend.title = element_text(size = 20)
+    )
+)
+
+ggsave(
+  here::here("writing/figures/g_value_endowment_presentation.png"), g_value_endowment_presentation,
+  height = 7.2,
+  width = 12,
+  dpi = 300
+)
+```
+
+# Illustration of the variability of profit and irrigation
+
+Uses the `sim_dist.rds` batch (10,000 paths per design, no summarization). Restrict to the first 10 years, $AL = 1$, $\gamma = 2$ designs, and the two corner values of $\tau$ (0 and 3). Draw ridgeline densities per year; blue for $\tau = 0$, yellow for $\tau = 3$.
+
+```{r}
+library(ggridges)
+library(ggplot2)
+library(viridis)
+
+dist_results <-
+  readRDS(here::here("results/sim_dist.rds")) %>%
+  .[period <= 10 & alloc_year == 1 & pen_ratio == 2, ] %>%
+  .[, .(period, ir, profit, max_co_ratio)] %>%
+  melt(id.vars = c("period", "max_co_ratio")) %>%
+  .[, type := case_when(
+    variable == "ir" ~ "Irrigation (inches)",
+    variable == "profit" ~ "Profit ($/acre)"
+  )]
+
+saveRDS(dist_results, here::here("results/dist_results_year_10.rds"))
+
+(
+  g_variability <-
+    ggplot(dist_results) +
+    geom_density_ridges(
+      aes(x = value, y = factor(period), fill = factor(max_co_ratio)),
+      scale = 3,
+      alpha = 0.5,
+      rel_min_height = 0.01
+    ) +
+    # scale_fill_viridis_d(name = "Carry-over ratio") +
+    scale_fill_manual(name = "Maximum carry-over ratio", values = c("0" = "#0000FF", "3" = "#FFFF00")) +
+    facet_grid(. ~ type, scale = "free_x") +
+    theme(
+      legend.position = "none",
+      panel.spacing = unit(0.5, "lines"),
+      strip.text.x = element_text(size = 8)
+    ) +
+    ylab("Year") +
+    xlab("") +
+    theme_bw() +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 12),
+      strip.background = element_rect(fill = NA),
+      strip.text = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 12)
+    )
+)
+
+
+ggsave(here::here("writing/figures/g_variability.png"), g_variability, height = 6, width = 6.5, dpi = 600)
+
+```
+
+```{r}
+g_variability_presentation <-
+  g_variability +
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_text(size = 20),
+    axis.title.y = element_text(size = 20),
+    axis.text = element_text(size = 20),
+    strip.text = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    legend.title = element_text(size = 20)
+  )
+
+ggsave(here::here("writing/figures/g_variability_presentation.png"), g_variability_presentation, height = 7, width = 12, dpi = 300)
+```
+
+# Quota design tables
+
+Two reference tables that summarize the real-world quota designs the simulation is calibrated against. Built as `flextable` objects. Each is saved as PNG (for slides and quick viewing) and as `.rds`; the manuscript loads the `.rds` and prints a real, editable table (PNAS requires editable tables).
+
+## Nebraska
+
+Manually compiled NRD-level summary: allocation period length, annual quota, carry-over rule, and overdraft penalty. Q and QS refer to remaining quota and quota surplus at the end of the cycle; QD refers to deficit.
+
+```{r}
+library(flextable)
+library(officer)
+
+quota_design_data <-
+  data.table(
+    nrd = c("Upper Niobrara White", "North Platte", "South Platte", "Tri-Basin", "Upper Republican", "Middle Republican", "Lower Republican", "Lower Platte North", "Lower Platte South", "Upper Elkhorn", "Lower Elkhorn ", "Upper Big Blue", "Little Blue", "Nemaha"),
+    allocation_length = c(5, 5, 3, 3, 5, 5, 5, 3, 3, 5, 1, 3, 5, 3),
+    annual_quota = c("13", "14", "13/14/16", "9", "12.5", "12", "9", "9", "7", "15/9", "8-15", "10", "13", "12"),
+    carry_over = c("min(32.5, QS)", "min(24, QS)", "min(10, QS)", "min(9, QS)", "QS", "min(12, QS)", "min(9, QS)", "QS", "QS", "min(5, QS)", "0 x QS", "0.1 x QS", "min(8, QS)", "min(12, QS)"),
+    penalty = c("I{QD < 2} QD + \n(1-I{QD < 2}) x (2 + 2 x (QD-2))", "Not known", "I{QD < 3} QD+\n(1-I{QD < 3}) x (3 + 2 x (QD-3))", "2 x QD", "2 x QD", "2 x QD", "I{QD < 3} QD +\n(1-I{QD < 3}) x (3 + 2 x (QD-3))", "6 x QD", "2 x QD", "5 x QD", "Reduces next 2-yr quota", "Not known", "2 x QD", "QD")
+  )
+
+(
+  qd_table_NE <-
+    quota_design_data %>%
+    flextable() %>%
+    set_header_labels(
+      nrd = "NRD",
+      allocation_length = "Length",
+      annual_quota = "Quota",
+      carry_over = "Carry-over",
+      penalty = "Penalty"
+    ) %>%
+    align(j = c(2, 3, 4), align = "center") %>%
+    align(j = c(1, 5), align = "left") %>%
+    align(j = 1:5, align = "center", part = "header") %>%
+    autofit() %>%
+    width(j = 1, width = 0.9) %>%
+    width(j = 2, width = 0.6) %>%
+    width(j = 3, width = 0.5) %>%
+    width(j = 4, width = 0.9) %>%
+    width(j = 5, width = 1.7) %>%
+    line_spacing(space = 1.4, part = "body") %>%
+    border_remove() %>%
+    hline(i = 1:13, border = officer::fp_border(color = "grey", width = 0.6)) %>%
+    hline_top(border = fp_border(color = "black", width = 0.8), part = "all") %>%
+    hline_bottom(border = fp_border(color = "black", width = 0.8), part = "all") %>%
+    footnote(
+      i = 1, j = 2:5, part = "header",
+      value = as_paragraph(
+        c(
+          " Length of a single allocation period in years.",
+          " Amount of annual quota in inches.",
+          " Amount of quota that can be carried over to the next allocation period in inches. Q and QS refer to remaining quota and quota surplus at the end of the allocation period, respectively.",
+          " Amount of reduction in quota applied in the next allocation period in inches. QD refers to deficit in quota at the end of the allocation period."
+        )
+      ),
+      ref_symbols = c(" a", " b", " c", " d"),
+      inline = TRUE,
+      sep = " "
+    ) %>%
+    footnote(
+      i = c(5, 8, 12), j = c(4, 1, 1), part = "body",
+      value = as_paragraph(
+        c(
+          " Full carry-over of unused quota (QS) is allowed, but balances above 7.5 inches mid-period trigger an additional 1-inch reduction.",
+          " Operates a rolling 3-year allocation: each year the use from 3 years prior drops out of the running total, rather than the period resetting at the end of 3 years. This rolling structure does not directly correspond to the discrete allocation-period framework used in this study.",
+          " Allocation rules not currently in effect (groundwater levels above the trigger threshold as of 2025); values shown are the prospective first-period parameters."
+        )
+      ),
+      ref_symbols = c(" e", " f", " g"),
+      inline = TRUE,
+      sep = " "
+    ) %>%
+    font(font = "Times", part = "all") %>%
+    fontsize(size = 8, part = "all") %>%
+    line_spacing(space = 1.2, part = "footer")
+)
+
+save_as_image(
+  qd_table_NE,
+  here::here("writing/figures/qd_table_NE.png"),
+  width = 6,
+  res = 600
+)
+
+saveRDS(qd_table_NE, here::here("results/qd_table_NE.rds"))
+```
+
+### Mini (for presentation)
+
+Four-NRD subset of the same table at projector-friendly font sizes.
+
+```{r}
+(
+  qd_table_NE_presentation <-
+    quota_design_data %>%
+    dplyr::filter(nrd %in% c("Upper Republican", "Tri-Basin", "Lower Platte North", "Lower Elkhorn ")) %>%
+    flextable() %>%
+    set_header_labels(
+      nrd = "NRD",
+      allocation_length = "Length",
+      annual_quota = "Annual Quota",
+      carry_over = "Carry-over",
+      penalty = "Exceedence Penalty"
+    ) %>%
+    align(j = 1:5, align = "center") %>%
+    align(j = 1:5, align = "center", part = "header") %>%
+    font(font = "Times", part = "all") %>%
+    fontsize(size = 15, part = "all") %>%
+    autofit() %>%
+    line_spacing(i = 1:4, space = 1.4) %>%
+    hline(i = 1:3, border = officer::fp_border(color = "grey"))
+
+  # add note on LPN, carry-over
+)
+
+save_as_image(qd_table_NE_presentation, here::here("writing/figures/qd_table_NE_presentation.png"), res = 400)
+```
+
+
+## Kansas
+
+Kansas counterpart of the Nebraska table. Rows are ordered by program type (IGUCA, LEMA, voluntary). The inline comments record provenance for two cells whose values came from external sources, not from a single Kansas-wide reference.
+
+```{r}
+library(flextable)
+library(officer)
+
+# Rows ordered by type: IGUCA first, then mandatory LEMAs, then voluntary programs.
+# Quota range for Walnut Creek updated from 5.25-14 to 4-14 based on KCUR reporting
+# (junior rights reduced to 4-6 in/yr, senior to 12-14 in/yr).
+# Central Kansas Water Bank carry-over updated to reflect both the deposit cap
+# (0.25 x QS per year) and the 10%/yr erosion of accumulated savings.
+# GMD1 LEMAs and MYFA added from web research.
+ks_data <- tribble(
+  ~Type,       ~Admin,                      ~allocation_length, ~annual_quota,    ~carry_over,                        ~penalty,
+  "IGUCA",     "Walnut Creek",              "5",                "4 - 14",         "QS",                               "2 x QD",
+  "IGUCA",     "Lower Smoky Hill",          "1",                "15",             "Not known",                        "Not known",
+  "LEMA",      "GMD4 Sheridan",             "5",                "11",             "min(5, QS)",                       "monetary/suspension",
+  "LEMA",      "GMD4 District-wide",        "5",                "12.9 - 16.1",    "min(0.1 x Q, QS)",                 "monetary/suspension",
+  "LEMA",      "GMD1 Wichita Co.",          "5",                "Individualized",  "Not known",                       "monetary/suspension",
+  "LEMA",      "GMD1 Four County",          "5",                "Individualized",  "Not known",                       "monetary/suspension",
+  "Voluntary", "MYFA (statewide)",          "5",                "Individualized",  "Up to ann. quota",                 "monetary/suspension",
+  "Voluntary", "Central Kansas Water Bank", "1",                "Individualized",  "0.25 x QS; 10%/yr erosion",        "monetary/suspension"
+)
+
+(
+  qd_table_KS <-
+    ks_data %>%
+    flextable() %>%
+    merge_v(j = "Type") %>%
+    valign(j = 1, valign = "center") %>%
+    set_header_labels(
+      Type             = "Type",
+      Admin            = "Administrative Unit",
+      allocation_length = "Length",
+      annual_quota     = "Quota",
+      carry_over       = "Carry-over",
+      penalty          = "Penalty"
+    ) %>%
+    align(j = c(3, 4, 5), align = "center") %>%
+    align(j = c(1, 2, 6), align = "left") %>%
+    align(j = 1:6, align = "center", part = "header") %>%
+    width(j = 1, width = 0.50) %>%
+    width(j = 2, width = 1.00) %>%
+    width(j = 3, width = 0.45) %>%
+    width(j = 4, width = 0.70) %>%
+    width(j = 5, width = 0.90) %>%
+    width(j = 6, width = 1.05) %>%
+    line_spacing(space = 1.4, part = "header") %>%
+    line_spacing(space = 1.4, part = "body") %>%
+    border_remove() %>%
+    # within-group separators (light grey)
+    hline(i = 1,       border = officer::fp_border(color = "grey", width = 0.6)) %>%
+    hline(i = c(3, 4, 5), border = officer::fp_border(color = "grey", width = 0.6)) %>%
+    hline(i = 7,       border = officer::fp_border(color = "grey", width = 0.6)) %>%
+    # between-group separators (dark)
+    hline(i = 2,       border = officer::fp_border(color = "black", width = 0.8)) %>%
+    hline(i = 6,       border = officer::fp_border(color = "black", width = 0.8)) %>%
+    hline_top(border = fp_border(color = "black", width = 0.8), part = "all") %>%
+    hline_bottom(border = fp_border(color = "black", width = 0.8), part = "all") %>%
+    footnote(
+      i = 1, j = 3:6, part = "header",
+      value = as_paragraph(
+        c(
+          " Length of a single allocation period in years.",
+          " Amount of annual quota in inches. For LEMAs individualized quotas are set as percentage reductions from 2011-2020 historical use (0-25% depending on historical application rate).",
+          " Amount of quota that can be carried over to the next allocation period in inches. Q and QS refer to remaining quota and quota surplus at the end of the allocation period, respectively. For MYFA, carry-over requires re-enrollment; up to one annual quota may carry forward. For the Central Kansas Water Bank, accumulated savings also erode at 10%/yr.",
+          " Amount of reduction in quota applied in the next allocation period in inches. QD refers to deficit in quota at the end of the allocation period."
+        )
+      ),
+      ref_symbols = c(" a", " b", " c", " d"),
+      inline = TRUE,
+      sep = " "
+    ) %>%
+    font(font = "Times", part = "all") %>%
+    fontsize(size = 8, part = "all") %>%
+    line_spacing(space = 1.2, part = "footer")
+)
+
+save_as_image(
+  qd_table_KS,
+  here::here("writing/figures/qd_table_KS.png"),
+  width = 6,
+  res = 600
+)
+
+saveRDS(qd_table_KS, here::here("results/qd_table_KS.rds"))
+```
+
+
+# Appendix
+
+`gen_results_figures(aq)` is the path-figure block from earlier, abstracted into a function of `annual_quota` so the same panel can be generated for any $AQ$. Called below for $AQ = 8$ and $AQ = 12$; the $AQ = 10$ version is produced inline above.
+
+```{r}
+gen_results_figures <- function(aq) {
+  path_data <-
+    sim_results %>%
+    .[annual_quota == aq, ] %>%
+    .[pen_ratio == 2, ] %>%
+    .[max_co_ratio %in% c(0, 0.5, 1, 2, 3), ] %>%
+    .[, `:=`(profit = mean(profit), ir = mean(ir)), by = .(alloc_period, annual_quota, max_co_ratio, pen_ratio, alloc_year)] %>%
+    .[, w_start := (max(W_start) - aq * alloc_year) / alloc_year, by = .(alloc_period, annual_quota, max_co_ratio, pen_ratio, alloc_year)] %>%
+    .[, .(profit, ir, w_start, period, alloc_period, max_co_ratio, alloc_year)] %>%
+    data.table::melt(id.vars = c("period", "alloc_period", "max_co_ratio", "alloc_year"), measure.vars = c("profit", "ir", "w_start")) %>%
+    .[, variable_text := case_when(
+      variable == "profit" ~ "Profit ($/acre)",
+      variable == "ir" ~ "Irrigation (inches)",
+      variable == "w_start" ~ "Banked Quota (inches)"
+    )] %>%
+    .[, alloc_year_txt := paste("Allocation period: ", alloc_year, " year(s)", sep = "")] %>%
+    .[, variable_text := factor(variable_text, levels = c("Profit ($/acre)", "Irrigation (inches)", "Banked Quota (inches)"))]
+
+  (
+    g_AQ_pen_2_co_varied <-
+      ggplot(data = path_data) +
+      geom_line(aes(y = value, x = period, color = factor(max_co_ratio))) +
+      facet_grid(variable_text ~ alloc_year_txt, scales = "free", switch = "y") +
+      scale_color_viridis_d(
+        name = "Maximum Carry-over Ratio",
+        option = "rocket",
+        direction = -1,
+        end = 0.9
+      ) +
+      xlab("Year") +
+      ylab("") +
+      scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50)) +
+      theme_ef +
+      theme(
+        strip.placement = "outside"
+      )
+  )
+
+  ggsave(
+    g_AQ_pen_2_co_varied,
+    file = here::here(paste0("writing/figures/path_AQ_", aq, "_pen_2_co_varied.png")),
+    width = 6.5,
+    height = 6,
+    dpi = 300
+  )
+}
+```
+
+Generate the two appendix figures.
+
+```{r}
+gen_results_figures(8)
+gen_results_figures(12)
+```
+

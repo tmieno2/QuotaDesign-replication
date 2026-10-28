@@ -1,0 +1,288 @@
+---
+title: Solve DP problem
+---
+
+# Purpose
+
+Stage 2 of the pipeline. For every combination of quota-design parameters $(AQ, AL, \eta, \tau, \gamma)$ in the design grid, solve the farmer's stochastic dynamic program by backward induction and save the resulting policy and value functions to disk. Builds on the frontier dataset from Stage 1 and on the helper functions in `code/R/backward_induction.R`.
+
+# Inputs
+
++ `data/processed/global_parameters.RData`: economic constants (`sigma`, `corn_P`, `ir_P`) produced in 01-data-prep.
++ `data/yield_water_data_for_summary.rds`: per-SMT expectations from 01-data-prep, used to re-index SMTs by ascending mean irrigation.
++ `data/yield_water_data_for_sim.rds`: per-cell yield-irrigation table on the frontier from 01-data-prep. Becomes `base_data`.
++ `code/R/backward_induction.R` (sourced elsewhere): defines `solve_BI`, `find_max_e_pi`, and `get_break_poitns`. Equations in this file map onto the lines flagged in the cross-reference at the bottom of 00-simulation-overview.
+
+# Outputs
+
++ `data/Processed/smt-data-in-expectation.rds`: per-SMT expected yield, expected irrigation, bin, and the re-indexed SMT id `new_smt`. Used downstream wherever SMTs need an ordering by irrigation intensity.
++ `data/Processed/smt-yield.rds`: per-cell `base_data` used by both the BI and the simulator. Includes the per-cell profit column $\pi(s,\phi) = p f - c g$.
++ `results/Profit_W_T.rds`: terminal-period one-shot payoff $\Pi(W)$ on a fine grid of $W$. Smoothed inside `solve_BI` to form $V_T$.
++ `results/parameter_set.rds`: the full quota-design grid (all combinations of $AQ, AL, \eta, \tau, \gamma$) with a `dp_result_file` column giving the on-disk location of the corresponding BI output.
++ `results/individual_parameters.RData`: the five 1-D parameter vectors that span the grid.
++ `results/qd_parameter_case_1.rds`: the case-1 subset of the grid restricted to $\eta = 1$.
++ `results/optimal_choice/opt_choice_design_aq_*_ay_*_max_co_ratio_*_co_*_pen_*.rds`: one file per design, each a list of length $T-1$ of `data.table`s mapping the beginning quota $W$ to $(s_t^\star, V_t)$.
+
+# Pipeline position
+
+Reads Stage 1 outputs; writes the policy library that Stage 3 (03-1-simulate.qmd) consumes via `simulate.R::sim_path`. The expensive chunks (terminal-period grid sweep and the BI loop) are marked `eval: false` so re-rendering the document does not re-run them; rebuild them by sourcing the chunks manually.
+
+# Key steps
+
+1. Load economic globals and rebuild `base_data` from the frontier dataset, attaching the re-indexed SMT id and the per-cell profit.
+2. Compute `max_ir`, used to set the lower edge of the $W$ grid.
+3. Define the design grid: cartesian product of `aq_ls`, `alloc_year_ls`, `pen_ratio_ls`, `co_ratio_ls`, `max_co_ratio_ls`, with an output-filename column.
+4. Build the quota grid `W_ls`, evaluate the static terminal payoff $\Pi(W)$ on it in parallel, and save.
+5. Carve out the case-1 subset ($\eta = 1$).
+6. Loop over case-1 designs in parallel, calling `solve_BI` for each one to run backward induction and write the per-design RDS.
+
+# Data Preparation
+
+## Global parameters
+
++ discount rate: `sigma <- 1 / (1 + 0.05)`
++ corn price ($/bu): `corn_P <- 4`
++ irrigation cost ($/inch): `ir_P <- 6`
+
+Reload the globals written in 01-data-prep.
+
+```{r}
+load(here::here("data/processed/global_parameters.RData"))
+```
+
+## Datasets
+
+We first import necessary data sets.
+
+**water-yield relationships on average**
+
+Re-index the frontier SMTs in ascending order of irrigation bin and assign a contiguous integer id `new_smt`. Indexing this way makes the downstream `setorder(smt)` calls actually sort by water intensity.
+
+```{r}
+e_data_for_summary <-
+  readRDS(here::here("data/yield_water_data_for_summary.rds")) %>%
+  setorder(bin) %>%
+  .[, new_smt := 1:nrow(.)]
+
+saveRDS(e_data_for_summary, here::here("data/processed/smt-data-in-expectation.rds"))
+```
+
+**water-yield relationships by SMT and year**
+
+Build the per-cell `base_data`: round yield to 1 dp and irrigation to 2 dp (to control floating-point clutter in joins), attach `new_smt`, drop the old `smt`, and compute per-cell profit $\pi(s,\phi) = p \cdot f(s,\phi) - c \cdot g(s,\phi)$. The constant $\lambda$ is omitted here because it does not affect $\arg\max_s$; it is added in 03-1-simulate.qmd.
+
+```{r}
+base_data <-
+  readRDS(here::here("data/yield_water_data_for_sim.rds")) %>%
+  .[, yield := round(yield, digits = 1)] %>%
+  .[, ir := round(ir, digits = 2)] %>%
+  e_data_for_summary[., on = "smt"] %>%
+  .[, .(new_smt, yield, ir, year)] %>%
+  setnames("new_smt", "smt") %>%
+  setorder(smt) %>%
+  .[, profit := corn_P * yield - ir_P * ir]
+
+saveRDS(base_data, here::here("data/processed/smt-yield.rds"))
+```
+
+`max_ir` is the largest per-cell irrigation observed on the frontier (rounded up). It sets the lower bound of the $W$ grid because the most negative beginning quota the value function ever sees is approximately $-\text{max\_ir}\cdot\gamma + W_{total}$ (when the penalty branch is most binding).
+
+```{r}
+#--- the maximum irrigation applied ---#
+max_ir <-
+  base_data[, ir] %>%
+  max() %>%
+  ceiling()
+```
+
+# Parameter Setup
+
+```{=tex}
+\begin{align}
+  & Max_{ir_{t}} \sum_{t=1}^{\infty} \delta^{t-1} \int\Big[p \cdot f(ir_{t}, 
+  \phi_t) - c\cdot g(ir_{t}, \phi_t) - \lambda \Big]d\phi_t \label{eq-objective}\\
+  &  s.t.\;\;  y_{t+1} = \left\{\begin{array}{lr}
+      y_t+1, & \text{if } y_t < AL \\
+      1, & \text{if } y_t=AL
+      \end{array}
+      \right\} \label{eq-em-year-in-cap} \\
+  & s.t.\;\; W_{t+1} = \left\{\begin{array}{lr}
+      W_t-w_t, & \text{if } y_t < AL \\
+      AL\cdot AQ + I(w_t) \cdot min(\tau \cdot AL \cdot AQ, \eta \cdot (W_t-w_t)) + (1- I(w_t)) \cdot \gamma \cdot (W_t-w_t), & \text{if } y_t = AL 
+      \end{array}
+      \right\} \label{eq-em-water-bank} \\
+  & s.t.\;\; ir_t = ir_0 \mbox{ if } W_t < 0\label{eq-no-irrigation}
+\end{align}
+```
+
+$ir_t$ and $\phi_t$ are irrigation strategy and weather in year $t$, respectively. Function $f(\cdot)$ maps irrigation strategy and weather to crop yield. The price of corn is represented by $p$ and thus $p\cdot f(ir_t, \phi_t)$ represents revenue. Function $g(\cdot)$ maps irrigation strategy and weather to irrigation amount. The price of irrigation is represented by $c$, which means $c\cdot g(ir_t, \phi_t)$ is the cost of irrigation. All non-water costs are fixed at $\lambda$, with $\sigma$ representing the discount factor. So, $p \cdot f(w_t) - c\cdot w_t - \lambda$ represents the profit. Therefore, we assume that farmer adopts an irrigation strategy each year that seeks to maximize their overall net present value of the expected profit.
+
+Year in the allocation period affects how water quota is updated. In the equation, $AQ$, $\eta$, $\gamma$, $y_t$, and $w_t$ are the annual allocation quota (inches), carry-over ratio ($\in [0,1]$), penalty parameter ($\in [1, \infty]$), and water use (shorthand notation for $g(ir_t, \phi_t)$), respectively. In addition, $I(w_t)$ represents and indicator variable that takes 1 if $W_t > w_t$ (i.e. when the remaining water quota in the next period is positive), 0 otherwise (i.e. if no quota remains). 
+
+If the farmer is not in the last year of an allocation period ($y_t < AL$), then the remaining quota at the next time period is simply obtained by subtracting water use ($w_t$) in the current period from the current remaining quota ($W_t$). In contrast, if the farmer is in the last year of an allocation period ($y_t = AL$), then the quota in the next period consists of two parts. First, the total quota for the next allocation period will be added to the farmers' quota bank as the base quota ($AL \cdot AQ$). If at the end of an allocation period the farmer has not used their full quota (i.e. $I(w_t)=1$), the remaining unused quota is multiplied by the carry-over ratio ($\eta \in [0, 1]$), which is then capped by the maximum quota carry-over allowed ($\tau$). On the other hand, if the farmer uses more than their allocation (i.e. $I(w_t)=0$), then the final quota balance is multiplied by the penalty factor ($\gamma$) which adjusts the allocation available for the next quota period.
+
++ $\tau$: `max_co_ratio`
++ $\eta$: `co_ratio`
++ $\gamma$: `pen_ratio`
++ $AQ$: `annual_quota`
++ $AL$: `alloc_year`
+
+## Complete set of quota design parameters
+
+Generate all the quota design parameter combinations for which the DP is solved.
+
+Five 1-D parameter vectors define the grid:
+
++ `aq_ls`: annual quotas from 6 to 13 inches in 0.25-inch steps.
++ `pen_ratio_ls`: penalty multipliers $\gamma \in \{1, 1.5, 2\}$.
++ `co_ratio_ls`: carry-over ratios $\eta \in \{0, 0.25, 0.5, 0.75, 1\}$.
++ `max_co_ratio_ls`: carry-over caps $\tau$ from 0 to 3 (multiples of $W_{total}$).
++ `alloc_year_ls`: allocation-period lengths $AL \in \{1, 3, 5\}$.
+
+`CJ` cross-joins them; the `dp_result_file` column encodes the design as a filename so the BI loop can write each design to its own RDS.
+
+```{r}
+#--- annual quota ---#
+aq_ls <- seq(6, 13, by = 0.25)
+
+#--- penalty ratio ---#
+pen_ratio_ls <- seq(1, 2, by = 0.5)
+
+#--- carry over ratio ---#
+co_ratio_ls <- c(0.5, seq(0, 1, by = 0.25))
+
+#--- maximum carry-over relative to allocation ---#
+max_co_ratio_ls <- c(seq(0, 1, by = 0.25), 1.5, 2, 3)
+
+#--- allocaiton years ---#
+alloc_year_ls <- seq(1, 5, by = 2)
+
+#--- all the combinations ---#
+parameter_set <-
+  data.table::CJ(
+    annual_quota = aq_ls,
+    alloc_year = alloc_year_ls,
+    pen_ratio = pen_ratio_ls,
+    co_ratio = co_ratio_ls,
+    max_co_ratio = max_co_ratio_ls
+  ) %>%
+  #--- max_co_ratio > 1 is only for alloc_year == 1 ---#
+  # .[!(max_co_ratio > 1 & alloc_year != 1), ] %>%
+  .[, dp_result_file :=
+    paste0(
+      "results/optimal_choice/opt_choice_design_aq_", annual_quota,
+      "_ay_", alloc_year,
+      "_max_co_ratio_", max_co_ratio,
+      "_co_", co_ratio,
+      "_pen_", pen_ratio,
+      ".rds"
+    )]
+
+saveRDS(parameter_set, here::here("results/parameter_set.rds"))
+
+save(aq_ls, pen_ratio_ls, co_ratio_ls, max_co_ratio_ls, alloc_year_ls, file = here::here("results/individual_parameters.RData"))
+```
+
+Note that `max_co_ratio > 1  is only for `alloc_year == 1`. This is because `max_co_ratio = 1` is not sufficient for the farmer to take the full advantage of the carry-over system when `alloc_year == 1`. Imagine the design with annual quota of 8 inches. Then, the maximum water bank the farmer can build is only 8 inches with `max_co_ratio = 1`.
+
+## Profit-W correspondence at the last period
+
+Find the best soil moisture target (SMT) and its associated utility for each level of quota in `W_ls` at the last period for all the parameter combinations in `parameter_set`.
+
+Build the quota grid: `W_min` is the smallest value that any design can reach when the penalty branch is most binding; `W_max` is the largest value any design can hold after carry-over. The grid is uniform at 0.1-inch resolution plus two near-zero points so the discontinuity at $W = 0$ (irrigation feasible vs rainfed-only) is resolved on both sides. `find_max_e_pi(W, data = base_data)` (defined in `code/R/backward_induction.R`) returns the static one-shot expected payoff $\Pi(W)$ with a within-period soft over-cap penalty of $100 \cdot \min(0, W - g)$. Marked `eval: false` because the grid sweep is the expensive precompute; only re-run when the grid or `base_data` changes.
+
+```{r}
+#| eval: false
+
+W_min <-
+  parameter_set[, floor(pmin(-max_ir, -max_ir * pen_ratio + W_total))] %>%
+  min()
+
+W_max <-
+  parameter_set[,  alloc_year * annual_quota * (1 + max_co_ratio)] %>%
+  max()
+
+W_ls <- c(seq(W_min, W_max, by = 0.1), -0.0001, 0.0001)
+
+Profit_W_T <-
+  mclapply(
+    W_ls,
+    \(x) {
+      print(x)
+      find_max_e_pi(x, data = base_data)
+    },
+    mc.cores = detectCores() - 4,
+    mc.preschedule = FALSE
+  ) %>%
+  rbindlist()
+
+saveRDS(Profit_W_T, here::here("results/Profit_W_T.rds"))
+```
+
+# Identify optimal decision via backward induction
+
+Reload $\Pi(W)$ so the BI loop has access to the terminal payoff without re-running the precompute.
+
+```{r}
+Profit_W_T <- readRDS(here::here("results/Profit_W_T.rds"))
+```
+
+## Case 1: carry-over ratio (`co_ratio`) is set to 1
+
+Here, carry over ratio is set to 1 while maximum quota allowed for carry over is varied.
+
+Case 1 is the subset of the full grid where unused quota carries forward at face value ($\eta = 1$); only the cap $\tau$ varies. This is the slice the manuscript focuses on.
+
+```{r}
+parameter_set <-
+  readRDS(here::here("results/parameter_set.rds")) %>%
+  .[co_ratio == 1, ]
+
+saveRDS(parameter_set, here::here("results/qd_parameter_case_1.rds"))
+```
+
+Implement backward induction for all the cases. In each round, the results are saved as an RDS file.
+
+For each row of the case-1 design grid, unpack the five design parameters, derive $W_{total} = AL \cdot AQ$, and call `solve_BI` (in `code/R/backward_induction.R`). Inside `solve_BI`: build $V_T$ as a monotone spline through $\Pi(W)$, then march backward from $t = T-1$ to $t = 1$ computing the per-row Bellman update and storing $(s_t^\star(W), V_t(W))$ in `opt_choice_ls[[t]]`. The result list is written to the per-design path in `results/optimal_choice/`. Marked `eval: false` for the same reason as the terminal-payoff chunk: it is the heaviest step in the pipeline.
+
+```{r}
+#| eval: false
+
+pbmclapply(
+  1:nrow(parameter_set),
+  \(i){
+    print(paste0("Working on ", i, "/", nrow(parameter_set)))
+
+    #--- annual quota ---#
+    annual_quota <- parameter_set[i, annual_quota]
+    #--- number of years within one allocation period ---#
+    alloc_year <- parameter_set[i, alloc_year]
+    #--- total quota per allocation period ---#
+    W_total <- alloc_year * annual_quota
+    #--- penalty ratio ---#
+    pen_ratio <- parameter_set[i, pen_ratio]
+    #--- carry-over ratio ---#
+    co_ratio <- parameter_set[i, co_ratio]
+    #--- maximum carry over allowed ---#
+    max_co_ratio <- parameter_set[i, max_co_ratio]
+    #--- file name of the results ---#
+    dp_result_file <- parameter_set[i, dp_result_file]
+
+    solve_BI(
+      last_period_data = Profit_W_T,
+      base_data = base_data,
+      annual_quota = annual_quota,
+      alloc_year = alloc_year,
+      pen_ratio = pen_ratio,
+      co_ratio = co_ratio,
+      max_co_ratio = max_co_ratio,
+      max_ir = max_ir,
+      output_file_name = dp_result_file
+    )
+  },
+  mc.cores = parallel::detectCores() - 4,
+  mc.preschedule = FALSE
+)
+```
+
+

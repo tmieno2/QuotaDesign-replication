@@ -1,0 +1,139 @@
+---
+title: Run simulations based on the DP solution
+params:
+  case: 1
+---
+
+# Purpose
+
+Stage 3 of the pipeline. For each case-1 quota design, forward-simulate many independent farmers who follow the optimal policy produced in Stage 2 under random weather draws, and save the resulting yield, irrigation, and profit trajectories. Three batches are run: a main sweep, an endowment sweep, and a small distribution batch that retains raw per-path output.
+
+# Inputs
+
++ `data/processed/smt-yield.rds`: per-cell yield-irrigation table (`base_data`) from 02-1.
++ `results/qd_parameter_case_1.rds`: the case-1 design grid from 02-1.
++ `data/processed/global_parameters.RData`: discount rate and prices.
++ `results/optimal_choice/opt_choice_*.rds`: per-design BI output from 02-1. Loaded inside `sim_path` (called from `batch_run_simulate`); not read directly here.
++ `code/R/simulate.R` (sourced elsewhere): defines `sim_path`, `batch_run_simulate`, `combine_results`. The random seed is fixed inside `sim_path` at `set.seed(784343)`.
+
+# Outputs
+
++ `Results/Simulation/sim_results_all.rds`: main run, per-design per-period summaries (mean and quantiles q0/q25/q50/q75/q100 over the simulated paths) with `endowment = 0`.
++ `results/sim_results_with_end.rds`: endowment sweep on a subset of designs (`annual_quota = 10`, `alloc_year` in {1, 3, 5}) crossed with `endowment` in 0:15.
++ `results/sim_dist.rds`: four corner designs simulated with `summarize = FALSE` so the full per-path distribution is retained; used to draw the variability ridgeline plot in 05.
++ Intermediate per-design files written by `batch_run_simulate` (one RDS per design) are produced as a side effect.
+
+# Pipeline position
+
+Reads Stage 1 base data, the case-1 design grid from Stage 2, and the per-design policy library produced by `solve_BI`. Writes the simulation outputs that feed all downstream summary and figure scripts (04-1, 04-2, 05, A-1).
+
+# Notes
+
++ Default `num_sim` in `sim_path` is 500,000 paths per design (per `simulate.R`); the distribution batch overrides to 10,000.
++ Profit at the simulator stage uses the full $\pi = p f - c g - \lambda$ with $\lambda = 600$ added in `simulate.R::sim_path` (cf. 00-simulation-overview Section 3.4).
++ Output filenames here are paths relative to the project root (`Results/`, `results/`); the same directory is referenced with two casings, which matters on case-sensitive file systems.
+
+# Preparation
+
+Data on yield (`yield`), irrigation amount (`ir`), and soil moisture target strategy (`smt`) for a given weather-year (`year`).
+
+```{r}
+(
+  base_data <- readRDS("data/processed/smt-yield.rds")
+)
+```
+
+Design parameter data:
+
+```{r}
+(
+  parameter_set <- readRDS(here::here("results/qd_parameter_case_1.rds"))
+)
+```
+
+Global parameters:
+
++ discount rate: `sigma <- 1 / (1 + 0.05)`
++ corn price ($/bu): `corn_P <- 4`
++ irrigation cost ($/inch): `ir_P <- 6`
+
+```{r}
+load(here::here("data/processed/global_parameters.RData"))
+```
+
+
+# Main simulation
+
+Run simulations (no endowment at the beginning of the regulation):
+
+For each case-1 design, simulate `num_sim` farmers starting at $W_1 = W_{total}$ (since `endowment = 0`) over $T$ periods. `batch_run_simulate` iterates over rows of `par_list` and calls `sim_path` for each; `combine_results` row-binds the per-design RDS files back into one table.
+
+```{r}
+main_par_list <-
+  parameter_set %>%
+  .[, endowment := 0]
+
+#--- run simulations ---#
+batch_run_simulate(par_list = main_par_list)
+
+#--- comnbine the results ---#
+main_results <- combine_results(par_list = main_par_list)
+
+#--- save ---#
+saveRDS(main_results, "results/simulation/sim_results_all.rds")
+```
+
+
+# Simulation with initial quota endowment
+
+Crosses a subset of designs with non-zero starting quotas, $W_1 = W_{total} + \text{endowment}$ for endowment in 0:15. Used in 05 to trace the value of an initial water gift as a function of the design (and to motivate the example-path plot for `alloc_year = 1, max_co_ratio = 3, pen_ratio = 2`).
+
+```{r}
+par_list_with_endowment <-
+  parameter_set %>%
+  .[annual_quota == 10, ] %>%
+  .[alloc_year %in% c(1, 3, 5), ] %>%
+  expand_grid_df(
+    .,
+    data.table(endowment = 0:15)
+  )
+
+#--- run simulations ---#
+batch_run_simulate(par_list_with_endowment)
+
+#--- combine the results ---#
+sim_results_with_end <- combine_results(par_list_with_endowment)
+
+saveRDS(sim_results_with_end, "results/sim_results_with_end.rds")
+```
+
+
+# Simulations for illustrating the distribution of water use and profit
+
+Four corner designs ($AQ = 10$; $AL \in \{1, 7\}$; $\gamma \in \{1, 2\}$; $\tau \in \{0, 3\}$) with `num_sim = 10000` and `summarize = FALSE` so raw per-path output is kept. `force_run = TRUE` overrides any cached on-disk results since the distribution batch uses a different RNG-realization count than the main run.
+
+```{r}
+#--- parameter sets ---#
+dist_par_list <-
+  parameter_set %>%
+  .[annual_quota == 10, ] %>%
+  .[alloc_year %in% c(1, 7), ] %>%
+  .[pen_ratio %in% c(1, 2), ] %>%
+  .[max_co_ratio %in% c(0, 3), ] %>%
+  .[, endowment := 0]
+
+#--- run simulations ---#
+batch_run_simulate(
+  dist_par_list,
+  file_name_append = "dist",
+  summarize = FALSE,
+  force_run = TRUE,
+  num_sim = 10000
+)
+
+#--- combine the results ---#
+dist_results <- combine_results(dist_par_list, file_name_append = "dist")
+
+saveRDS(dist_results, "results/sim_dist.rds")
+```
+
